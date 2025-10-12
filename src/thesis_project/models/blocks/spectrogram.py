@@ -10,8 +10,9 @@ class SpectrogramBlock(torch.nn.Module):
 
     Args:
         sample_rate (int): Audio sample rate in Hz. Default: 16000.
-        n_fft (int): FFT window size. Default: 1024.
-        hop_length (int): Hop (stride) length between STFT windows. Default: 256.
+        n_fft (int): FFT window size. Default: 512.
+        win_length (Optional[int]): Window length. If None, uses n_fft. Default: None.
+        hop_length (Optional[int]): Hop (stride) length between STFT windows. If None, uses win_length // 2. Default: None.
         n_mels (Optional[int]): Number of mel filterbanks. If None, uses linear frequency bins.
         power (Optional[float]): Exponent for magnitude:
             - 2.0 → power spectrogram (energy)
@@ -24,16 +25,17 @@ class SpectrogramBlock(torch.nn.Module):
     def __init__(
         self,
         sample_rate: int = 16000,
-        n_fft: int = 1024,
-        hop_length: int = 256,
+        n_fft: int = 512,
+        win_length: Optional[int] = None,
+        hop_length: Optional[int] = None,
         n_mels: Optional[int] = None,
         power: Optional[float] = 1.0,    # Default: magnitude,
         logarithm: bool = True,          # Default: log scale (dB)
     ) -> None:
-        
         super().__init__()
         self.sample_rate = sample_rate
         self.n_fft = n_fft
+        self.window_length = win_length
         self.hop_length = hop_length
         self.n_mels = n_mels
         self.power = power
@@ -43,6 +45,7 @@ class SpectrogramBlock(torch.nn.Module):
         if n_mels is None:
             self.spec = T.Spectrogram(
                 n_fft=n_fft,
+                win_length=win_length,
                 hop_length=hop_length,
                 power=power,
             )
@@ -50,6 +53,7 @@ class SpectrogramBlock(torch.nn.Module):
             self.spec = T.MelSpectrogram(
                 sample_rate=sample_rate,
                 n_fft=n_fft,
+                win_length=win_length,
                 hop_length=hop_length,
                 n_mels=n_mels,
                 power=power, # pyright: ignore[reportArgumentType]
@@ -66,7 +70,9 @@ class SpectrogramBlock(torch.nn.Module):
             self.db = None
 
         # Inverse transforms
-        self.inv = T.InverseSpectrogram(n_fft=n_fft, hop_length=hop_length)
+        self.inv = T.InverseSpectrogram(n_fft=n_fft,
+                                        win_length=win_length,
+                                        hop_length=hop_length)
         self.inv_mel = (
             T.InverseMelScale(
                 n_stft=n_fft // 2 + 1,

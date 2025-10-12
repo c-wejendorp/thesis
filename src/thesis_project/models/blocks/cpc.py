@@ -3,7 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 #TODO consider making a parent class and then this a subclass specifically for svd. This would make it easier to add other compression methods later.
-class CompressedPointwiseConv1d(nn.Module):
+# Compressed Pointwise Conv1d (via Low-Rank Approximation (SVD)
+class CPC_Conv1d(nn.Module):
     def __init__(self, in_channels, out_channels, rank=None, bias=True):
         super().__init__()
 
