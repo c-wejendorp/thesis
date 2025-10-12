@@ -27,8 +27,8 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
         self.transform = transform
 
         # Build label maps WITHOUT loading audio: use folder names of files in _walker
-        labels = sorted({Path(p).parent.name for p in self._walker})
-        self.label_to_idx = {lbl: i for i, lbl in enumerate(labels)}
+        self.labels = sorted({Path(p).parent.name for p in self._walker})
+        self.label_to_idx = {lbl: i for i, lbl in enumerate(self.labels)}
         self.idx_to_label = {i: lbl for lbl, i in self.label_to_idx.items()}
         
     # NOTE: If more information is needed use get_metadata from parent class.
