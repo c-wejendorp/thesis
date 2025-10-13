@@ -1,0 +1,18 @@
+num_classes: 35
+
+spectrogram:
+  sample_rate: 16000
+  n_fft: 512
+
+backbone:
+  n_channels_ext: 128
+  n_channels_int: 128
+  kernel_size: 3
+  dropout: 0.1
+  causal: true
+  n_blocks_pr_stack: 3
+  dilation_base: 2
+  n_stacks: 1
+  residual_in_blocks: true
+  residual_in_stacks: false
+  use_custom_pw: true

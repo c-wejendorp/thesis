@@ -15,6 +15,7 @@ class DDWS_Conv1d(nn.Module):
             dilation,        # dilation rate
             dropout,         # dropout rate
             causal,          # causal: no future information
+            use_custom_pw: bool = True,
             **kwargs
         ):
         super().__init__()
@@ -26,8 +27,10 @@ class DDWS_Conv1d(nn.Module):
         self.causal = causal
         self.padding = (kernel_size - 1) * dilation if causal else dilation
         ## PointWise1
-        #self.pw_conv1 = nn.Conv1d(n_channels_ext, n_channels_int, 1)
-        self.cpw_conv1 = CPC_Conv1d(n_channels_ext, n_channels_int, bias=True) #TODO figure out if we want bias here
+        if use_custom_pw:
+            self.cpw_conv1 = CPC_Conv1d(n_channels_ext, n_channels_int, bias=True) #TODO figure out if we want bias here
+        else:
+            self.pw_conv1 = nn.Conv1d(n_channels_ext, n_channels_int, 1)
         self.act1 = nn.PReLU(num_parameters=1)
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = nn.BatchNorm1d(n_channels_int)
@@ -44,14 +47,15 @@ class DDWS_Conv1d(nn.Module):
         self.dropout2 = nn.Dropout(dropout)
         self.norm2 = nn.BatchNorm1d(n_channels_int)
         ## PointWise2
-        #self.pw_conv2 = nn.Conv1d(n_channels_int, n_channels_ext, 1, bias=False)
-        self.cpw_conv2 = CPC_Conv1d(n_channels_int, n_channels_ext, bias=False) #TODO figure out if we want bias here
-
+        if use_custom_pw:
+            self.cpw_conv2 = CPC_Conv1d(n_channels_int, n_channels_ext, bias=False) #TODO figure out if we want bias here
+        else:
+            self.pw_conv2 = nn.Conv1d(n_channels_int, n_channels_ext, 1, bias=False)
         # add the compressed pointwise 1d conv layers (linear layers) to a module such that can be easily found and rank changed
         self.cpw_layers = nn.ModuleList([self.cpw_conv1, self.cpw_conv2])
 
     def forward(self, x):
-        return x + self.forward_no_residual(x)
+        return self.forward_no_residual(x)
     
     def forward_no_residual(self, x):
         x = self.cpw_conv1(x)
