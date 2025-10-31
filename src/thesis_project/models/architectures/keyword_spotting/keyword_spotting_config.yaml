@@ -16,3 +16,7 @@ backbone:
   residual_in_blocks: true
   residual_in_stacks: false
   use_custom_pw: true
+
+noise:
+  noise_mode: "std"
+  noise_params: [0.00, 0.05, 0.1, 0.15, 0.20, 0.25]

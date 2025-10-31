@@ -21,8 +21,12 @@ class BackboneConfig(BaseModel):
         True, description="Use CPC_Conv1d for pointwise convolutions."
     )
 
+class NoiseConfig(BaseModel):
+    noise_mode: str | None = None
+    noise_params: list[float] | None = None
 
 class KeyWordSpottingConfig(BaseModel):
     spectrogram: SpectrogramConfig
     backbone: BackboneConfig
+    noise: NoiseConfig
     num_classes: int = 35
