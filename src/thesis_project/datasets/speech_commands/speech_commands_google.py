@@ -8,7 +8,13 @@ import random
 from collections import defaultdict, Counter
 from torch import Tensor
 
-from .noise_functions import load_random_noise_chunk, add_noise_at_snr
+import warnings
+
+from .noise_functions import (
+    load_random_noise_chunk,
+    attach_deterministic_noise_to_samples,
+    add_noise_at_snr
+)
 from .config import NOISE_FOLDER, NOISE_FILES, SAMPLE_RATE, TARGET_LENGTH, CANONICAL
 
 class PadOrTrim():
@@ -45,13 +51,14 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
         self,
         *args,
         subset: Optional[str] = None,
-        keyword_list: list[str] | None = None,
+        keyword_list: Optional[list[str]] = CANONICAL,
         use_unknown: bool = True,
         use_silence: bool = True,
         upsample: bool = False,
         transform=None,
         add_noise: bool = True,
         noise_prob: float = 0.9,
+        background_noise_folder: str = NOISE_FOLDER,
         silence_files: list[str] = NOISE_FILES,
         noise_files: list[str] = NOISE_FILES,
         
@@ -62,14 +69,16 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
 
         # training, validation, testing subsets
         self.subset = subset
-
+        self.evaluation = subset in ("validation", "testing")
         # Keywords and class configuration
-        self.keywords = keyword_list if keyword_list is not None else CANONICAL
-        self.keywords_set = set(self.keywords)
+        self.keywords_set = set(keyword_list) # type: ignore
         self.use_unknown = use_unknown
         self.use_silence = use_silence
+        self.background_noise_folder = Path(self._path, background_noise_folder)
         if use_silence:
-             self.silence_paths = sorted(str(p) for p in Path(self._path, NOISE_FOLDER).glob("*.wav") if p.name in silence_files)
+            self.silence_paths = self._load_noise_paths(
+                self.background_noise_folder, silence_files, "use_silence"
+            )
         self.upsample = upsample
 
         # Tranforms
@@ -79,7 +88,9 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
         # Noise files for silence samples (clips without speech) or to sample noise to add to speech samples
         self.add_noise = add_noise
         if self.add_noise:
-            self.noise_paths = sorted(str(p) for p in Path(self._path, NOISE_FOLDER).glob("*.wav") if p.name in noise_files)
+            self.noise_paths = self._load_noise_paths(
+                self.background_noise_folder, noise_files, "add_noise"
+            )
             self.noise_prob = noise_prob
             self._set_snr(snr)
         else: 
@@ -106,25 +117,51 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
 
     def _set_snr(self, snr: float | tuple[float, float]) -> None:
         """Validate and store SNR configuration."""
-        # first check that add_noise is True
         assert self.add_noise, "Cannot set SNR if add_noise is False."
 
-        if isinstance(snr, tuple):
-            if len(snr) != 2:
-                raise ValueError("snr must be a float or a (low, high) tuple.")
+        # Ranges not allowed in evaluation mode
+        if self.evaluation and isinstance(snr, tuple):
+            raise ValueError("In evaluation mode, snr must be a single float (or inf).")
+
+        # Float case (includes float('inf'))
+        if isinstance(snr, (int, float)):
+            self.snr = float(snr)
+            return
+        
+        # Tuple case
+        if (
+            isinstance(snr, tuple)
+            and len(snr) == 2
+            and all(isinstance(x, (int, float)) for x in snr)
+        ):
             low, high = snr
             if low > high:
-                raise ValueError("snr range must be ordered (low <= high).")
+                raise ValueError("snr range must satisfy low <= high.")
             self.snr = (float(low), float(high))
-        elif isinstance(snr, (int, float)):
-            self.snr = float(snr)
-        elif snr == float('inf'):
-            # No noise addition, so set snr to infinity
-            self.snr = float('inf')
-        else:
-            raise TypeError("snr must be float, (float, float) tuple")
+            return
+
+        # Anything else is invalid
+        raise TypeError("snr must be a float or (float, float).")
+        
+    def _load_noise_paths(self, base_dir: Path, file_list: list[str], flag_name: str) -> list[str]:
+        """
+        Returns sorted noise paths filtered by file_list.
+        Falls back to white_noise.wav and warns if none found.
+        """
+        paths = sorted(str(p) for p in base_dir.glob("*.wav") if p.name in file_list)
+
+        if not paths:
+            white = base_dir / "white_noise.wav"
+            paths = [str(white)]
+            warnings.warn(
+                f"{flag_name}=True but none of the requested files were found. "
+                f"Falling back to white_noise.wav."
+            )
+
+        return paths
 
     def _init_all_labels(self) -> None:
+        raise NotImplementedError("This method need to be checked and possibly modified.")
         """Plain parent behaviour, with label maps and transforms."""
         labels = sorted({Path(p).parent.name for p in self._walker})
         self.labels = labels
@@ -230,7 +267,7 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
             if not self.silence_paths:
                 raise RuntimeError(
                     "use_silence=True but no noise files were found "
-                    f"in folder: {NOISE_FOLDER}"
+                    f"in folder: {self.background_noise_folder}"
                 )
 
             n_silence = max_kw_count
@@ -245,7 +282,15 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
                 )
 
         self.samples = samples
-
+        if self.evaluation:
+            self.samples = attach_deterministic_noise_to_samples(
+                samples=self.samples,
+                noise_paths=self.noise_paths,
+                target_length=TARGET_LENGTH,
+                sample_rate=SAMPLE_RATE,
+                seed=12345, # arbitrary fixed seed for reproducibility
+            )
+        
         # ---------- Label mapping ----------
         labels = list(sorted(self.keywords_set))
         if self.use_unknown:
@@ -274,16 +319,35 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
             waveform, label_idx, meta_data = self._getitem_custom(n)
         else:
             waveform, label_idx, meta_data = self._getitem_all(n)
+        
 
         meta_data["snr_value"] = float('inf')  # default: no noise added
-        if not self.add_noise or self.snr == float('inf'):
+        if not self.add_noise or self.snr == float('inf') or meta_data["label"] == "SILENCE": # don't add noise to silence samples
             return waveform, label_idx, meta_data
-        else:
-            if random.random() < self.noise_prob:  # decide randomly whether to add noise or not
-                snr_value = self._sample_snr_value() # if just a single float, this will always return that value, otherwise sample from range
-                waveform = self._add_noise(waveform, snr_value)
-                meta_data["snr_value"] = snr_value
 
+        if self.evaluation:
+            # Evaluation mode: deterministic noise already attached so we overide the random sampled noise from _getitem_custom
+            noise = meta_data["noise"]
+            noise_type = meta_data["noise_type"]
+    
+        # Training mode: sample noise randomly
+        else:
+            # decide randomly whether to add noise or not
+            if random.random() < self.noise_prob:
+                noise, noise_type  = self._load_random_noise_chunk(self.noise_paths)
+                meta_data["noise"] = noise
+                meta_data["noise_type"] = noise_type
+            else:
+                noise = None
+                meta_data["noise"] = None
+                meta_data["noise_type"] = None
+        
+        if noise is None:
+            return waveform, label_idx, meta_data
+    
+        snr_value = self._sample_snr_value() # sampled SNR value or fixed float if in eval mode
+        meta_data["snr_value"] = snr_value
+        waveform = add_noise_at_snr(waveform, noise, snr_value)
         return waveform, label_idx, meta_data
     
     # ------------------------------------------------------------------
@@ -307,24 +371,56 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
         return waveform, label_idx, meta_data
 
     def _getitem_custom(self, n: int) -> tuple[Tensor, int, dict]:
+
         sample_info = self.samples[n]
         kind = sample_info["kind"]
         label_str = sample_info["label"]
 
+        # Noise may or may not be present depending on train/eval
+        noise = sample_info.get("noise", None)
+        noise_type = sample_info.get("noise_type", None)
+
+        # ------------------------------
+        # Keyword / Unknown samples
+        # ------------------------------
         if kind in ("keyword", "unknown"):
             walker_idx = sample_info["walker_idx"]
             waveform, sample_rate, utterance, speaker_id, utterance_number = super().__getitem__(walker_idx)
+
+        # ------------------------------
+        # Silence samples
+        # ------------------------------
         elif kind == "silence":
-            waveform = self._load_random_noise_chunk()
+
+            if self.evaluation:
+                # Deterministic silence noise must have been attached beforehand
+                assert noise is not None, (
+                    "Silence sample in evaluation mode must have deterministic noise "
+                    "attached by attach_deterministic_noise_to_samples()."
+                )
+                waveform = noise
+            else:
+                # Random silence chunk during training
+                waveform, noise_type = self._load_random_noise_chunk(self.silence_paths)
+
             sample_rate = SAMPLE_RATE
             utterance = "SILENCE"
+            utterance_number = -1
             speaker_id = "SILENCE"
-            utterance_number = -1 # set to -1 to avoid issue with collate function in torch
+
+            # Silence uses its waveform as the noise source
+            noise = waveform.clone()
+
+        # ------------------------------
+        # Should never happen
+        # ------------------------------
         else:
             raise RuntimeError(f"Unknown sample kind: {kind}")
 
+        # Apply transform (PadOrTrim, etc.)
         waveform = self._apply_transform(waveform)
 
+        # Metadata package
         meta_data = {
             "sample_rate": sample_rate,
             "label": label_str,
@@ -332,6 +428,8 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
             "utterance_number": utterance_number,
             "speaker_id": speaker_id,
             "raw_signal": waveform.clone(),
+            "noise": noise,
+            "noise_type": noise_type,
         }
 
         label_idx = self.label_to_idx[label_str]
@@ -352,13 +450,10 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
         low, high = self.snr
         return float(torch.empty(1).uniform_(low, high).item())
 
-    def _load_random_noise_chunk(self):
+    def _load_random_noise_chunk(self, noise_paths: list[str]) -> tuple[Tensor, str]:
         return load_random_noise_chunk(
-            noise_paths=self.noise_paths,
+            noise_paths=noise_paths,
             target_length=TARGET_LENGTH,
             sample_rate=SAMPLE_RATE,
         )
-    
-    def _add_noise(self, waveform: Tensor, snr_value: float) -> Tensor:
-        return add_noise_at_snr(waveform, snr_value )
     
