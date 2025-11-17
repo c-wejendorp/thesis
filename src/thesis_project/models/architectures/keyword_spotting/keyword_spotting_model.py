@@ -55,7 +55,7 @@ class KeyWordSpottingModel(nn.Module):
         # --- Classifier ---
         self.classifier = nn.Linear(
             cfg.backbone.n_channels_ext,
-            cfg.num_classes,
+            cfg.dataset.num_classes,
             bias=True,
         )
 

@@ -1,4 +1,12 @@
 NOISE_FOLDER = "_background_noise_"
+NOISE_FILES = [
+    "doing_the_dishes.wav",
+    "dude_miaowing.wav",
+    "exercise_bike.wav",
+    "pink_noise.wav",
+    "running_tap.wav",
+    "white_noise.wav",
+]
 SAMPLE_RATE = 16000
 TARGET_LENGTH = 16000  # 1 second
 

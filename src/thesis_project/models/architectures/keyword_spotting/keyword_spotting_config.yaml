@@ -1,5 +1,3 @@
-num_classes: 35
-
 spectrogram:
   sample_rate: 16000
   n_fft: 512
@@ -17,6 +15,22 @@ backbone:
   residual_in_stacks: false
   use_custom_pw: true
 
+dataset:
+  key_words:
+    - yes
+    - no
+    - up
+    - down
+    - left
+    - right
+    - on
+    - off
+    - stop
+    - go
+  use_unknown: true
+  use_silence: true
+  upsample: false
+
 noise:
-  noise_mode: "std"
-  noise_params: [0.00, 0.05, 0.1, 0.15, 0.20, 0.25]
+  add_noise: true
+  noise_prob: 0.9

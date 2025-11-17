@@ -1,5 +1,4 @@
-from pydantic import BaseModel, Field
-
+from pydantic import BaseModel, computed_field, Field
 
 class SpectrogramConfig(BaseModel):
     sample_rate: int
@@ -21,12 +20,23 @@ class BackboneConfig(BaseModel):
         True, description="Use CPC_Conv1d for pointwise convolutions."
     )
 
+class DatasetConfig(BaseModel):
+    key_words: list[str]
+    use_unknown: bool
+    use_silence: bool
+    upsample: bool
+    @computed_field
+    @property
+    def num_classes(self) -> int:
+        return len(self.key_words) + int(self.use_unknown) + int(self.use_silence)
+
 class NoiseConfig(BaseModel):
-    noise_mode: str | None = None
-    noise_params: list[float] | None = None
+    add_noise: bool
+    noise_prob: float
+    snr: float | tuple[float, float]
 
 class KeyWordSpottingConfig(BaseModel):
     spectrogram: SpectrogramConfig
     backbone: BackboneConfig
+    dataset: DatasetConfig
     noise: NoiseConfig
-    num_classes: int = 35
