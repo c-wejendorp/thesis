@@ -33,4 +33,4 @@ dataset:
 
 noise:
   add_noise: true
-  noise_prob: 0.9
+  noise_prob: 0.8

@@ -27,78 +27,57 @@ class PadOrTrim():
 
 
 class SpeechCommandsGoogle(SPEECHCOMMANDS):
-    """
-    Extended Speech Commands dataset.
-
-    Options:
-        - keyword_list: list of target keywords (default: CANONICAL).
-        - use_unknown: add an 'unknown' class from non-keyword commands.
-        - use_silence: add a 'silence' class from background noise chunks.
-        - upsample:
-            * False:
-                - keep ALL keyword samples
-                - make unknown and silence have as many samples
-                  as the LARGEST keyword class.
-            * True:
-                - upsample EVERY active class (keywords, unknown, silence)
-                  so they all have the same size as the LARGEST keyword class.
-
-        - transform: applied to waveform (e.g. PadOrTrim()).
-        - snr: float or (low, high) to add white noise at given SNR (dB).
-    """
-
     def __init__(
         self,
         *args,
         subset: Optional[str] = None,
-        keyword_list: Optional[list[str]] = CANONICAL, #
-        use_unknown: bool = True, # unknown is samples from the rest of the keywords not present in the key_word_list
-        use_silence: bool = True, # silence is just noise without any utterance present
+        keyword_list: Optional[list[str]] = CANONICAL,
+        use_unknown: bool = True,
+        use_silence: bool = True,
         upsample: bool = False,
-        seed: int = 789, # used for upsampling and unknown selection
+        seed: int = 789,
         transform=None,
         add_noise: bool = True,
         noise_prob: float = 0.9,
         background_noise_folder: str = NOISE_FOLDER,
         noise_files: list[str] = NOISE_FILES,
-        snr: float | tuple[float, float] = (-5,15),  # in dB
+        snr: float | tuple[float, float] = (-5, 15),
         **kwargs,
     ):
         super().__init__(*args, subset=subset, **kwargs)
 
-        # training, validation, testing subsets
         self.subset = subset
         self.evaluation = subset in ("validation", "testing")
 
-        # Keywords and class configuration
+        # Keywords
         self.keywords_set = set(keyword_list) if keyword_list is not None else set(ALL_KEYWORDS)
         self.use_unknown = use_unknown
         self.use_silence = use_silence
-        self.background_noise_folder = Path(self._path, background_noise_folder)
-        if use_silence:
-            self.silence_paths = self._load_noise_paths(
-                self.background_noise_folder, noise_files, "use_silence"
-            )
         self.upsample = upsample
         self.seed = seed
-        # Tranforms
+
         self.transform = transform if transform is not None else PadOrTrim()
 
-        # Noise configuration
-        # Noise files for silence samples (clips without speech) or to sample noise to add to speech samples
+        # --- Noise paths are always loaded ---
+        self.background_noise_folder = Path(self._path, background_noise_folder)
+        self.noise_paths = self._load_noise_paths(
+            self.background_noise_folder, noise_files, "noise_files"
+        )
+        if self.use_silence:
+            # Silence uses the same pool now
+            self.silence_paths = self.noise_paths
+
+        # --- Noise injection configuration ---
         self.add_noise = add_noise
         if self.add_noise:
-            self.noise_paths = self._load_noise_paths(
-                self.background_noise_folder, noise_files, "add_noise"
-            )
             self.noise_prob = noise_prob
             self._set_snr(snr)
-        else: 
-            self.noise_paths = []
+        else:
             self.noise_prob = 0.0
-            self.snr = float('inf')
+            self.snr = float("inf")
 
         self._init_labels()
+
 
     # ------------------------------------------------------------------
     # Initialization helpers
@@ -250,7 +229,9 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
                 )
 
         self.samples = samples
-        if self.evaluation and self.add_noise:
+        if self.evaluation:
+            # Always attach deterministic noise in eval,
+            # independent of whether we will actually add it to waveforms.
             self.samples = attach_deterministic_noise_to_samples(
                 samples=self.samples,
                 noise_paths=self.noise_paths,
@@ -285,64 +266,93 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
         walker_idx = sample_info["walker_idx"]
 
         noise = sample_info.get("noise", None)
-        noise_type = sample_info.get("noise_type", None)
+        noise_type = sample_info.get("noise_type", None)  # may start as None
 
-        # handle the silence class first since it needs special handling regardless of we add noise or not. 
+        # --------- 1) Load base waveform (before transforms) ---------
         if kind == "silence":
-            if self.evaluation and self.add_noise:
-                # we should never see that we are in eval and then we have noise none
-                assert noise is not None, ("Silence samples in evaluation should already have deterministic noise attached")
-                assert noise_type is not None, ("Silence samples in evaluation should already have deterministic noise_type attached")
+            if self.evaluation:
+                # In eval we ALWAYS expect deterministic noise attached for silence
+                assert noise is not None, (
+                    "Silence samples in evaluation should already have deterministic noise attached"
+                )
+                assert noise_type is not None, (
+                    "Silence samples in evaluation should already have deterministic noise_type attached"
+                )
                 waveform = noise.clone()
                 utterance = noise_type
             else:
+                # Training: random silence chunk
                 waveform, utterance = self._load_random_noise_chunk(self.silence_paths)
-                
+
             sample_rate = SAMPLE_RATE
             utterance_number = -1
             speaker_id = "SILENCE"
-            
+
         elif kind in ("keyword", "unknown"):
             waveform, sample_rate, utterance, speaker_id, utterance_number = super().__getitem__(walker_idx)
-        
-        else: 
+
+        else:
             raise RuntimeError(f"Unknown sample kind: {kind}")
-        
+
+        # --------- 2) Transform ---------
         waveform = self._apply_transform(waveform)
         waveform_post_transform = waveform.clone()
-        
-        snr_value = float('inf')  # default: no noise added
-        if not self.add_noise:
-            noise = torch.zeros_like(waveform)
-            noise_type = None
-        else:
-            snr_value = self._sample_snr_value() # in eval mode this inforced to be a fixed value
 
-            if self.evaluation:
-                assert noise is not None, "In evaluation mode and adding noise, all samples should already have deterministic noise attached"
-                assert noise_type is not None, "In evaluation mode and adding noise, all samples should already have a deterministic noise_type attached"
+        # --------- 3) Noise injection / SNR logic ---------
+        snr_value = float("inf")  # default: no noise added
 
-                if kind == "silence":
-                    snr_value = float('inf')
-            
-                else:
-                    waveform = add_noise_at_snr(waveform, noise, snr_value)
-                    
+        if self.evaluation:
+            # ================= EVAL MODE =================
+            if not self.add_noise:
+                # Eval WITHOUT noise:
+                # - waveform stays as loaded (clean speech or deterministic silence)
+                # - reset noise metadata so it clearly indicates "no noise used"
+                noise = torch.zeros_like(waveform)
+                noise_type = ""  # <- string, not None
+                snr_value = float("inf")
             else:
-                if kind == "silence":
-                        noise = waveform.clone()
-                        noise_type = utterance   
+                # Eval WITH deterministic noise:
+                # attach_deterministic_noise_to_samples should have filled these
+                assert noise is not None, (
+                    "In evaluation mode and add_noise=True, all samples should have deterministic noise attached"
+                )
+                assert noise_type is not None, (
+                    "In evaluation mode and add_noise=True, all samples should have a deterministic noise_type attached"
+                )
 
-                else: # keyword or unknown
+                if kind == "silence":
+                    # Silence is pure (deterministic) noise; SNR not meaningful
+                    snr_value = float("inf")
+                else:
+                    # Keywords/unknown: inject deterministic noise at fixed eval SNR
+                    snr_value = self._sample_snr_value()  # fixed float in eval
+                    waveform = add_noise_at_snr(waveform, noise, snr_value)
+
+        else:
+            # ================= TRAIN MODE =================
+            if not self.add_noise:
+                # Train WITHOUT noise: keep waveform clean, but give a zero-noise tensor
+                noise = torch.zeros_like(waveform)
+                noise_type = ""  # <- string, not None
+                snr_value = float("inf")
+            else:
+                snr_value = self._sample_snr_value()
+
+                if kind == "silence":
+                    # Silence is just its own noise in training
+                    noise = waveform.clone()
+                    noise_type = utterance  # filename / descriptor string
+                else:  # keyword or unknown
                     if random.random() < self.noise_prob:
-                        noise, noise_type  = self._load_random_noise_chunk(self.noise_paths)
+                        noise, noise_type = self._load_random_noise_chunk(self.noise_paths)
                         waveform = add_noise_at_snr(waveform, noise, snr_value)
                     else:
-                        # noise is a zero tensor length of waveform and noisetype is None.
-                        noise =torch.zeros_like(waveform) # to avoid torch collate problems this cant be None
-                        # noise type should still be none here 
-                        assert noise_type is None, ("Noise_type is not None when adding noise and training mode")
-        
+                        # No noise added: zero tensor to keep collate happy
+                        noise = torch.zeros_like(waveform)
+                        # Explicitly mark "no noise type" as empty string
+                        noise_type = ""
+
+        # --------- 4) Metadata ---------
         meta_data = {
             "sample_rate": sample_rate,
             "label": label_str,
@@ -351,11 +361,14 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
             "speaker_id": speaker_id,
             "waveform_post_transform": waveform_post_transform,
             "noise": noise,
-            "noise_type": noise_type,
-            "snr": snr_value
+            "noise_type": noise_type,  # always a string now
+            "snr": snr_value,
         }
         label_idx = self.label_to_idx[label_str]
         return waveform, label_idx, meta_data
+
+
+
 
     # ------------------------------------------------------------------
     # Utility helpers
