@@ -15,7 +15,7 @@ from .noise_functions import (
     attach_deterministic_noise_to_samples,
     add_noise_at_snr
 )
-from .config import NOISE_FOLDER, NOISE_FILES, SAMPLE_RATE, TARGET_LENGTH, CANONICAL
+from .config import NOISE_FOLDER, NOISE_FILES, SAMPLE_RATE, TARGET_LENGTH, CANONICAL, ALL_KEYWORDS
 
 class PadOrTrim():
     def __init__(self, max_len: int = TARGET_LENGTH, pad_value: float = 0.0,):
@@ -51,17 +51,16 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
         self,
         *args,
         subset: Optional[str] = None,
-        keyword_list: Optional[list[str]] = CANONICAL,
-        use_unknown: bool = True,
-        use_silence: bool = True,
+        keyword_list: Optional[list[str]] = CANONICAL, #
+        use_unknown: bool = True, # unknown is samples from the rest of the keywords not present in the key_word_list
+        use_silence: bool = True, # silence is just noise without any utterance present
         upsample: bool = False,
+        seed: int = 789, # used for upsampling and unknown selection
         transform=None,
         add_noise: bool = True,
         noise_prob: float = 0.9,
         background_noise_folder: str = NOISE_FOLDER,
-        silence_files: list[str] = NOISE_FILES,
         noise_files: list[str] = NOISE_FILES,
-        
         snr: float | tuple[float, float] = (-5,15),  # in dB
         **kwargs,
     ):
@@ -70,17 +69,18 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
         # training, validation, testing subsets
         self.subset = subset
         self.evaluation = subset in ("validation", "testing")
+
         # Keywords and class configuration
-        self.keywords_set = set(keyword_list) # type: ignore
+        self.keywords_set = set(keyword_list) if keyword_list is not None else set(ALL_KEYWORDS)
         self.use_unknown = use_unknown
         self.use_silence = use_silence
         self.background_noise_folder = Path(self._path, background_noise_folder)
         if use_silence:
             self.silence_paths = self._load_noise_paths(
-                self.background_noise_folder, silence_files, "use_silence"
+                self.background_noise_folder, noise_files, "use_silence"
             )
         self.upsample = upsample
-
+        self.seed = seed
         # Tranforms
         self.transform = transform if transform is not None else PadOrTrim()
 
@@ -98,18 +98,7 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
             self.noise_prob = 0.0
             self.snr = float('inf')
 
-        # If nothing special is requested, fall back to "all labels" mode
-        if (
-            keyword_list is None
-            and not use_unknown
-            and not use_silence
-            and not upsample
-        ):
-            self._use_custom_view = False
-            self._init_all_labels()
-        else:
-            self._use_custom_view = True
-            self._init_custom_labels()
+        self._init_labels()
 
     # ------------------------------------------------------------------
     # Initialization helpers
@@ -160,17 +149,7 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
 
         return paths
 
-    def _init_all_labels(self) -> None:
-        raise NotImplementedError("This method need to be checked and possibly modified.")
-        """Plain parent behaviour, with label maps and transforms."""
-        labels = sorted({Path(p).parent.name for p in self._walker})
-        self.labels = labels
-        self.label_to_idx = {lbl: i for i, lbl in enumerate(self.labels)}
-        self.idx_to_label = {i: lbl for lbl, i in self.label_to_idx.items()}
-        self.label_counts = Counter(Path(p).parent.name for p in self._walker)
-        self.samples: list[dict] = []
-
-    def _init_custom_labels(self) -> None:
+    def _init_labels(self) -> None:
         """
         Build a custom view with:
           - selected keywords (self.keywords)
@@ -185,8 +164,6 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
             - for each active class (keywords, unknown, silence),
               sample/oversample so they ALL have size = LARGEST keyword class.
         """
-        rng = random.Random(0)  # deterministic selection
-
         # Map walker indices into keywords / unknown
         per_keyword: dict[str, list[int]] = defaultdict(list)
         unknown_idxs: list[int] = []
@@ -209,34 +186,27 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
         samples: list[dict] = []
 
         # ---------- 1) Keyword samples ----------
-        if self.upsample:
-            # Upsample each keyword class to max_kw_count
-            for kw in sorted(self.keywords_set):
-                idxs = per_keyword[kw]
+        rng_upsample = random.Random(self.seed)
+        for kw in sorted(self.keywords_set):
+            idxs = per_keyword[kw]
+
+            if self.upsample:
                 if len(idxs) >= max_kw_count:
-                    chosen = rng.sample(idxs, max_kw_count)
+                    chosen = rng_upsample.sample(idxs, max_kw_count)
                 else:
-                    chosen = rng.choices(idxs, k=max_kw_count)
-                for idx in chosen:
-                    samples.append(
-                        {
-                            "kind": "keyword",
-                            "label": kw,
-                            "walker_idx": idx,
-                        }
-                    )
-        else:
-            # No upsampling: keep all samples for each keyword
-            for kw in sorted(self.keywords_set):
-                idxs = per_keyword[kw]
-                for idx in idxs:
-                    samples.append(
-                        {
-                            "kind": "keyword",
-                            "label": kw,
-                            "walker_idx": idx,
-                        }
-                    )
+                    chosen = rng_upsample.choices(idxs, k=max_kw_count)
+            else:
+                # No upsampling: keep all samples for each keyword
+                chosen = idxs
+
+            samples.extend(
+                {
+                    "kind": "keyword",
+                    "label": kw,
+                    "walker_idx": idx,
+                }
+                for idx in chosen
+            )
 
         # ---------- 2) Unknown samples (optional) ----------
         if self.use_unknown:
@@ -244,15 +214,14 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
                 raise RuntimeError(
                     "No non-keyword commands available to form the 'unknown' class."
                 )
-
+            rng_unknown = random.Random(self.seed)  # deterministic selection for unknowns
             # Unknown size is always max_kw_count, regardless of upsample flag:
             n_unknown = max_kw_count
 
             if len(unknown_idxs) >= n_unknown:
-                unknown_chosen = rng.sample(unknown_idxs, n_unknown)
+                unknown_chosen = rng_unknown.sample(unknown_idxs, n_unknown)
             else:
-                unknown_chosen = rng.choices(unknown_idxs, k=n_unknown)
-
+                unknown_chosen = rng_unknown.choices(unknown_idxs, k=n_unknown)
             for idx in unknown_chosen:
                 samples.append(
                     {
@@ -261,7 +230,6 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
                         "walker_idx": idx,
                     }
                 )
-
         # ---------- 3) Silence / noise samples (optional) ----------
         if self.use_silence:
             if not self.silence_paths:
@@ -282,13 +250,13 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
                 )
 
         self.samples = samples
-        if self.evaluation:
+        if self.evaluation and self.add_noise:
             self.samples = attach_deterministic_noise_to_samples(
                 samples=self.samples,
                 noise_paths=self.noise_paths,
                 target_length=TARGET_LENGTH,
                 sample_rate=SAMPLE_RATE,
-                seed=12345, # arbitrary fixed seed for reproducibility
+                seed=self.seed,
             )
         
         # ---------- Label mapping ----------
@@ -299,139 +267,93 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
             labels.append("SILENCE")
 
         self.labels = labels
+        self.label_counts = Counter(s["label"] for s in self.samples)
         self.label_to_idx = {lbl: i for i, lbl in enumerate(self.labels)}
         self.idx_to_label = {i: lbl for lbl, i in self.label_to_idx.items()}
-
-        self.label_counts = Counter(s["label"] for s in self.samples)
 
     # ------------------------------------------------------------------
     # Core Dataset API
     # ------------------------------------------------------------------
 
     def __len__(self) -> int:
-        if self._use_custom_view:
-            return len(self.samples)
-        else:
-            return len(self._walker)
-
+        return len(self.samples)
+    
     def __getitem__(self, n: int) -> tuple[Tensor, int, dict]:
-        if self._use_custom_view:
-            waveform, label_idx, meta_data = self._getitem_custom(n)
-        else:
-            waveform, label_idx, meta_data = self._getitem_all(n)
-        
-
-        meta_data["snr_value"] = float('inf')  # default: no noise added
-        if not self.add_noise or self.snr == float('inf') or meta_data["label"] == "SILENCE": # don't add noise to silence samples
-            return waveform, label_idx, meta_data
-
-        if self.evaluation:
-            # Evaluation mode: deterministic noise already attached so we overide the random sampled noise from _getitem_custom
-            noise = meta_data["noise"]
-            noise_type = meta_data["noise_type"]
-    
-        # Training mode: sample noise randomly
-        else:
-            # decide randomly whether to add noise or not
-            if random.random() < self.noise_prob:
-                noise, noise_type  = self._load_random_noise_chunk(self.noise_paths)
-                meta_data["noise"] = noise
-                meta_data["noise_type"] = noise_type
-            else:
-                noise = None
-                meta_data["noise"] = None
-                meta_data["noise_type"] = None
-        
-        if noise is None:
-            return waveform, label_idx, meta_data
-    
-        snr_value = self._sample_snr_value() # sampled SNR value or fixed float if in eval mode
-        meta_data["snr_value"] = snr_value
-        waveform = add_noise_at_snr(waveform, noise, snr_value)
-        return waveform, label_idx, meta_data
-    
-    # ------------------------------------------------------------------
-    # __getitem__ helpers
-    # ------------------------------------------------------------------
-
-    def _getitem_all(self, n: int) -> tuple[Tensor, int, dict]:
-        raise NotImplementedError("This method need to be checked and possibly modified.")
-        waveform, sample_rate, label, speaker_id, utterance_number = super().__getitem__(n)
-        waveform = self._apply_transform(waveform)
-
-        meta_data = {
-            "sample_rate": sample_rate,
-            "label": label,
-            "speaker_id": speaker_id,
-            "utterance": label,
-            "utterance_number": utterance_number,
-            "raw_signal": waveform.clone(),
-        }
-        label_idx = self.label_to_idx[label]
-        return waveform, label_idx, meta_data
-
-    def _getitem_custom(self, n: int) -> tuple[Tensor, int, dict]:
-
         sample_info = self.samples[n]
-        kind = sample_info["kind"]
         label_str = sample_info["label"]
+        kind = sample_info["kind"]
+        walker_idx = sample_info["walker_idx"]
 
-        # Noise may or may not be present depending on train/eval
         noise = sample_info.get("noise", None)
         noise_type = sample_info.get("noise_type", None)
 
-        # ------------------------------
-        # Keyword / Unknown samples
-        # ------------------------------
-        if kind in ("keyword", "unknown"):
-            walker_idx = sample_info["walker_idx"]
-            waveform, sample_rate, utterance, speaker_id, utterance_number = super().__getitem__(walker_idx)
-
-        # ------------------------------
-        # Silence samples
-        # ------------------------------
-        elif kind == "silence":
-
-            if self.evaluation:
-                # Deterministic silence noise must have been attached beforehand
-                assert noise is not None, (
-                    "Silence sample in evaluation mode must have deterministic noise "
-                    "attached by attach_deterministic_noise_to_samples()."
-                )
-                waveform = noise
+        # handle the silence class first since it needs special handling regardless of we add noise or not. 
+        if kind == "silence":
+            if self.evaluation and self.add_noise:
+                # we should never see that we are in eval and then we have noise none
+                assert noise is not None, ("Silence samples in evaluation should already have deterministic noise attached")
+                assert noise_type is not None, ("Silence samples in evaluation should already have deterministic noise_type attached")
+                waveform = noise.clone()
+                utterance = noise_type
             else:
-                # Random silence chunk during training
-                waveform, noise_type = self._load_random_noise_chunk(self.silence_paths)
-
+                waveform, utterance = self._load_random_noise_chunk(self.silence_paths)
+                
             sample_rate = SAMPLE_RATE
-            utterance = "SILENCE"
             utterance_number = -1
             speaker_id = "SILENCE"
-
-            # Silence uses its waveform as the noise source
-            noise = waveform.clone()
-
-        # ------------------------------
-        # Should never happen
-        # ------------------------------
-        else:
+            
+        elif kind in ("keyword", "unknown"):
+            waveform, sample_rate, utterance, speaker_id, utterance_number = super().__getitem__(walker_idx)
+        
+        else: 
             raise RuntimeError(f"Unknown sample kind: {kind}")
-
-        # Apply transform (PadOrTrim, etc.)
+        
         waveform = self._apply_transform(waveform)
+        waveform_post_transform = waveform.clone()
+        
+        snr_value = float('inf')  # default: no noise added
+        if not self.add_noise:
+            noise = torch.zeros_like(waveform)
+            noise_type = None
+        else:
+            snr_value = self._sample_snr_value() # in eval mode this inforced to be a fixed value
 
-        # Metadata package
+            if self.evaluation:
+                assert noise is not None, "In evaluation mode and adding noise, all samples should already have deterministic noise attached"
+                assert noise_type is not None, "In evaluation mode and adding noise, all samples should already have a deterministic noise_type attached"
+
+                if kind == "silence":
+                    snr_value = float('inf')
+            
+                else:
+                    waveform = add_noise_at_snr(waveform, noise, snr_value)
+                    
+            else:
+                if kind == "silence":
+                        noise = waveform.clone()
+                        noise_type = utterance   
+
+                else: # keyword or unknown
+                    if random.random() < self.noise_prob:
+                        noise, noise_type  = self._load_random_noise_chunk(self.noise_paths)
+                        waveform = add_noise_at_snr(waveform, noise, snr_value)
+                    else:
+                        # noise is a zero tensor length of waveform and noisetype is None.
+                        noise =torch.zeros_like(waveform) # to avoid torch collate problems this cant be None
+                        # noise type should still be none here 
+                        assert noise_type is None, ("Noise_type is not None when adding noise and training mode")
+        
         meta_data = {
             "sample_rate": sample_rate,
             "label": label_str,
             "utterance": utterance,
             "utterance_number": utterance_number,
             "speaker_id": speaker_id,
-            "raw_signal": waveform.clone(),
+            "waveform_post_transform": waveform_post_transform,
             "noise": noise,
             "noise_type": noise_type,
+            "snr": snr_value
         }
-
         label_idx = self.label_to_idx[label_str]
         return waveform, label_idx, meta_data
 
@@ -456,4 +378,3 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
             target_length=TARGET_LENGTH,
             sample_rate=SAMPLE_RATE,
         )
-    
