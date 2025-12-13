@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import warnings
 
-class CPC_Conv1d(nn.Module):
+class LowRankPointwiseConv1d(nn.Module):
     def __init__(self, in_channels, out_channels, bias=True):
         super().__init__()
         conv_init = nn.Conv1d(in_channels, out_channels, kernel_size=1, bias=bias)
@@ -80,7 +80,7 @@ if __name__ == "__main__":
     B, C_in, C_out, T = 4, 8, 6, 10
     x = torch.randn(B, C_in, T)
 
-    layer = CPC_Conv1d(C_in, C_out)
+    layer = LowRankPointwiseConv1d(C_in, C_out)
 
     print("=== Full conv (no ranks) ===")
     y_full = layer(x)

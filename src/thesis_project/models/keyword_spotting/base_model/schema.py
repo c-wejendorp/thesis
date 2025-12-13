@@ -4,7 +4,6 @@ class SpectrogramConfig(BaseModel):
     sample_rate: int
     n_fft: int
 
-
 class BackboneConfig(BaseModel):
     n_channels_ext: int
     n_channels_int: int
