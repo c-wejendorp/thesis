@@ -3,6 +3,7 @@
 from pathlib import Path
 from typing import List, Tuple
 import random
+from tqdm import tqdm
 
 import torch
 from torch import Tensor
@@ -92,7 +93,7 @@ def attach_deterministic_noise_to_samples(
     )
     rng = random.Random(seed)
 
-    for sample in samples:
+    for sample in tqdm(samples, desc="Adding noise", unit="sample", total=len(samples)):
         noise_chunk, noise_type = choose_deterministic_noise_chunk(
             noise_paths=noise_paths,
             rng=rng,
