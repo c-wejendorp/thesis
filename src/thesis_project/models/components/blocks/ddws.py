@@ -49,14 +49,6 @@ class DDWS_Conv1d(nn.Module):
         else:
             self.pw_layer_2 = nn.Conv1d(n_channels_int, n_channels_ext, 1, bias=False)
 
-        # easy access to the low-rank layers inside this block
-        self.lowrank_pw_layers = nn.ModuleList(
-            [m for m in (self.pw_layer_1, self.pw_layer_2) if isinstance(m, LowRankPointwiseConv1d)]
-        )
-
-    def iter_lowrank_pw(self):
-        return iter(self.lowrank_pw_layers)
-
     def forward(self, x: torch.Tensor, ranks=None) -> torch.Tensor:
         if self.use_custom_pw:
             x = self.pw_layer_1(x, ranks)

@@ -14,49 +14,43 @@ class LowRankPointwiseConv1d(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
 
+        self.max_rank = min(in_channels, out_channels)
         # Max rank where low-rank compute <= full compute (MACs) for kernel_size=1
         r_break_even = (in_channels * out_channels) // (in_channels + out_channels)
         self.max_useful_rank = max(1, min(in_channels, out_channels, r_break_even))
 
         self.U = self.S = self.V = None  # U:(out,R) S:(R,) V:(R,in)
 
-    def activate_low_rank(self, R: int):
-        R_req = int(R)
-        R = max(1, min(R_req, self.max_useful_rank))
-
-        if R < R_req:
-            warnings.warn(
-                f"Requested rank {R_req} exceeds max_useful_rank={self.max_useful_rank}. "
-                f"Clamping to R={R}.",
-                RuntimeWarning,
-            )
-
+    def activate_low_rank(self):
         W = self.weight_full.detach().squeeze(-1)  # (out,in)  (detach => no grads through SVD)
         U, S, Vt = torch.linalg.svd(W, full_matrices=False)
 
-        self.U = nn.Parameter(U[:, :R].clone())
-        self.S = nn.Parameter(S[:R].clone())
-        self.V = nn.Parameter(Vt[:R, :].clone())
+        self.U = nn.Parameter(U[:, :self.max_rank].clone())
+        self.S = nn.Parameter(S[:self.max_rank].clone())
+        self.V = nn.Parameter(Vt[:self.max_rank, :].clone())
 
     def deactivate_low_rank(self):
         self.U = self.S = self.V = None
+
+    @property
+    def low_rank_active(self) -> bool:
+        return self.S is not None
 
     def forward(self, x, ranks=None):
         low_rank_ready = (self.U is not None)  # source of truth
 
         if ranks is not None and not low_rank_ready:
-            raise RuntimeError("ranks was provided, but low-rank is not activated. Call activate_low_rank(R) first.")
+            raise RuntimeError("ranks was provided, but low-rank is not activated. Call activate_low_rank() first.")
 
         if ranks is None:
             return F.conv1d(x, self.weight_full, self.bias)
 
         # Low-rank path
         B = x.size(0)
-        R = self.S.numel() #type: ignore
 
         if isinstance(ranks, int):
             ranks = torch.full((B,), ranks, device=x.device)
-        ranks = torch.as_tensor(ranks, device=x.device).long().clamp(1, R)
+        ranks = torch.as_tensor(ranks, device=x.device).long().clamp(1, self.max_rank)
 
         # fast path: all ranks equal
         if (ranks == ranks[0]).all():
@@ -69,7 +63,7 @@ class LowRankPointwiseConv1d(nn.Module):
         SV = (self.S[:, None] * self.V).unsqueeze(-1)              # (R,in,1) #type: ignore
         h = F.conv1d(x, SV, bias=None)                             # (B,R,T)
 
-        k = torch.arange(R, device=x.device)[None, :]
+        k = torch.arange(self.max_rank, device=x.device)[None, :]
         h = h * (k < ranks[:, None]).to(h.dtype)[:, :, None]
 
         return F.conv1d(h, self.U.unsqueeze(-1), self.bias) #type: ignore
@@ -93,7 +87,7 @@ if __name__ == "__main__":
         print("Caught expected error:", e)
 
     print("\n=== Activate low-rank ===")
-    layer.activate_low_rank(R=5)
+    layer.activate_low_rank()
     print("max_useful_rank:", layer.max_useful_rank)
 
     print("\n=== Static rank (int) ===")

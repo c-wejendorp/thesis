@@ -34,7 +34,7 @@ class NoiseConfig(BaseModel):
     noise_prob: float
     snr: float | tuple[float, float]
 
-class KeyWordSpottingConfig(BaseModel):
+class KeyWordSpottingBaseConfig(BaseModel):
     spectrogram: SpectrogramConfig
     backbone: BackboneConfig
     dataset: DatasetConfig

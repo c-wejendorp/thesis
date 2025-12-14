@@ -34,3 +34,4 @@ dataset:
 noise:
   add_noise: true
   noise_prob: 0.8
+  snr: [0, 10]
