@@ -4,6 +4,8 @@ from tqdm import tqdm
 from datetime import datetime
 import os
 
+from thesis_project.utils.paths import create_run_folder
+
 
 def validate_model(model, val_loader, criterion, device, snr_values=None, verbose=True):
     """
@@ -60,32 +62,6 @@ def validate_model(model, val_loader, criterion, device, snr_values=None, verbos
                 print(f"SNR={snr}: loss={avg_loss:.4f}, acc={avg_acc:.2f}%")
 
     return results
-
-
-
-import numpy as np
-import torch
-from tqdm import tqdm
-from datetime import datetime
-
-
-# -------------------------------------------------------------------------
-# Helper: create timestamped run folder under model_runs/base/
-# -------------------------------------------------------------------------
-def create_run_folder(base_dir="model_runs/base"):
-    """
-    Creates a unique folder with timestamp inside base_dir.
-
-    Example:
-        model_runs/base/2025-12-14_18-04-11/
-
-    Returns:
-        run_dir (str): The created directory path.
-    """
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    run_dir = os.path.join(base_dir, timestamp)
-    os.makedirs(run_dir, exist_ok=True)
-    return run_dir
 
 
 # -------------------------------------------------------------------------

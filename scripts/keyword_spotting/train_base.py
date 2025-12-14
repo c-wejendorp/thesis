@@ -24,12 +24,17 @@ np.random.seed(42)
 # Device selection: CUDA > MPS > CPU
 if torch.cuda.is_available():
     device = torch.device("cuda")
+    pin_memory = True
+    num_workers = 16
     print("Using CUDA")
 elif torch.backends.mps.is_available():
     device = torch.device("mps")
+    pin_memory = False
+    num_workers = 0
     print("Using MPS")
 else:
     device = torch.device("cpu")
+    pin_memory = False
     print("Using CPU")
 
 
@@ -38,10 +43,10 @@ else:
 #Datasets and dataloaders
 data_dir = get_data_dir()
 train_set = SpeechCommandsGoogle(root=str(data_dir), subset="training", download=True, **noise_train_cfg.model_dump())
-train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, pin_memory = pin_memory, num_workers=num_workers)
 
 val_set = SpeechCommandsGoogle(root=str(data_dir), subset="validation", download=True, **noise_eval_cfg.model_dump())
-val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
+val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, pin_memory = pin_memory, num_workers=num_workers)
 
 # Model
 model = KWSBase(cfg).to(device)
