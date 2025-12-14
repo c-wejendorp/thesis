@@ -13,3 +13,6 @@ wheels/
 
 # ds store files
 .DS_Store
+
+# full models
+model_runs/
