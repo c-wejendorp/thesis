@@ -39,6 +39,8 @@ else:
 
 
 # ACTUALTRAINING  SETUP
+# Model
+model = KWSBase(cfg).to(device)
 
 #Datasets and dataloaders
 data_dir = get_data_dir()
@@ -47,9 +49,6 @@ train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, pin_me
 
 val_set = SpeechCommandsGoogle(root=str(data_dir), subset="validation", download=True, **noise_eval_cfg.model_dump())
 val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, pin_memory = pin_memory, num_workers=num_workers)
-
-# Model
-model = KWSBase(cfg).to(device)
 
 # Loss function and optimizer
 criterion = nn.CrossEntropyLoss()

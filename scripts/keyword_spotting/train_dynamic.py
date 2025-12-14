@@ -1,0 +1,62 @@
+import yaml
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+import numpy as np
+
+from thesis_project.models.keyword_spotting import KWSBase, KWSDynamic
+from thesis_project.models.components.routers import GRURouter
+from thesis_project.utils.paths import get_data_dir
+from thesis_project.datasets import SpeechCommandsGoogle
+from base_config_temp import cfg, noise_train_cfg, noise_eval_cfg
+
+
+# Training configuration
+batch_size = 64
+num_epochs = 30
+init_learning_rate = 1e-3
+
+torch.manual_seed(42)
+np.random.seed(42)
+
+# Device selection: CUDA > MPS > CPU
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+    pin_memory = True
+    num_workers = 16
+    print("Using CUDA")
+elif torch.backends.mps.is_available():
+    device = torch.device("mps")
+    pin_memory = False
+    num_workers = 0
+    print("Using MPS")
+else:
+    device = torch.device("cpu")
+    pin_memory = False
+    print("Using CPU")
+
+# ACTUALTRAINING  SETUP
+
+# Model
+base_model = KWSBase(cfg).to(device)
+base_model.load_state_dict(torch.load("model_runs/base/2025-12-14_18-48-50/best_model.pth"))
+router = GRURouter(
+    input_dim=base_model.spectrogram_bins, #type: ignore
+    fc_hidden_dim=128,
+    gru_hidden_dim=64,
+    num_gru_layers=1,
+    max_rank=64).to(device)
+
+model = KWSDynamic(base=base_model, router=router, low_rank_frontend=False).to(device)
+
+#test input =
+
+#Datasets and dataloaders
+data_dir = get_data_dir()
+train_set = SpeechCommandsGoogle(root=str(data_dir), subset="training", download=True, **noise_train_cfg.model_dump())
+train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, pin_memory = pin_memory, num_workers=num_workers)
+test_batch = next(iter(train_loader))
+test_inputs, test_labels, meta = test_batch
+print("Test input shape:", test_inputs.shape)
+# val_set = SpeechCommandsGoogle(root=str(data_dir), subset="validation", download=True, **noise_eval_cfg.model_dump())
+# val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, pin_memory = pin_memory, num_workers=num_workers)

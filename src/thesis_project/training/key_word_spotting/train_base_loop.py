@@ -7,7 +7,7 @@ import os
 from thesis_project.utils.paths import create_run_folder
 
 
-def validate_model(model, val_loader, criterion, device, snr_values=None, verbose=True):
+def validate_model(model, val_loader, criterion, device, snr_values=None, verbose=True, fixed_rank=None):
     """
     Evaluate `model` on the same validation set for different SNR values.
 
@@ -37,7 +37,14 @@ def validate_model(model, val_loader, criterion, device, snr_values=None, verbos
                 waveforms = waveforms.to(device)
                 labels = labels.to(device)
 
-                logits = model(waveforms)
+                if fixed_rank is not None:
+                    rank = fixed_rank
+                else:
+                    rank = None
+                
+         
+                logits = model(waveforms, ranks=rank)
+
                 loss = criterion(logits, labels)
 
                 batch_size = labels.size(0)

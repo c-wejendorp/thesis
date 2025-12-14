@@ -6,14 +6,18 @@ from typing import Sequence, Optional
 
 class KWSDynamic(nn.Module):
     #TODO make a baseclass for the router
-    def __init__(self, base: KWSBase, router : GRURouter, low_rank_frontend: bool = False):
+    def __init__(self, base: KWSBase, router : GRURouter, low_rank_frontend: bool = False, freze_base: bool = True) -> None:
         super().__init__()
 
         # --- Base ---
         self.base = base
+        if freze_base:
+            for param in self.base.parameters():
+                param.requires_grad = False
+
+        self.router = router
         # enables low-rank in all stacks by default, low-rank frontend can be controlled separately
         self.base.toggle_low_rank(low_rank_frontend=low_rank_frontend) 
-        self.router = router
 
     def toggle_low_rank(
         self,
