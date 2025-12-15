@@ -14,12 +14,26 @@ from thesis_project.training.key_word_spotting import CrossEntropyPlusRankLoss, 
 #TODO: Should not be hardcoded here
 # Training configuration
 batch_size = 64
-num_epochs = 30
+num_epochs = 10
 init_learning_rate = 1e-4
 
 maximum_useful_rank = 64
-target_rank = 16
-target_rank_normalized = (target_rank - 1) / (maximum_useful_rank - 1)
+target_rank_mean = 16
+target_rank_std = 4
+
+# Scale factor from rank-space → normalized space
+scale = 1.0 / (maximum_useful_rank - 1)
+
+# Normalized mean and std
+target_rank_mean_norm = (target_rank_mean - 1) * scale
+target_rank_std_norm = target_rank_std * scale
+
+# Normalized distribution in [~0, ~1]
+target_rank_distribution = torch.distributions.Normal(
+    loc=target_rank_mean_norm,
+    scale=target_rank_std_norm
+)
+
 
 torch.manual_seed(42)
 np.random.seed(42)
@@ -52,6 +66,7 @@ router = GRURouter(
     num_gru_layers=1,
     max_rank=maximum_useful_rank,
     last_layer_bias_init= 4.0 # to bias towards full rank at start
+    #last_layer_bias_init= None,
     ).to(device)
 
 
@@ -81,10 +96,10 @@ val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, pin_memor
 
 # Loss function and optimizer
 criterion = CrossEntropyPlusRankLoss(
-    target_rank_normalized=target_rank_normalized,
+    target_rank_normalized_distribution=target_rank_distribution,
     rank_loss_weight=1.0,
-    rank_loss_mode="batch_mean_mse",
-    rank_var_weight=0.1,
+    rank_loss_mode="per_sample_mse",
+    rank_var_weight=0.0,
 )
 optimizer = torch.optim.Adam(model.parameters(), lr=init_learning_rate)
 

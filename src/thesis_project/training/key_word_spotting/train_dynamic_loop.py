@@ -55,7 +55,7 @@ class CrossEntropyPlusRankLoss(nn.Module):
     def __init__(
         self,
         *,
-        target_rank_normalized: float,
+        target_rank_normalized_distribution: torch.distributions.Distribution,
         rank_loss_weight: float,
         rank_loss_mode: Literal["batch_mean_mse", "per_sample_mse"] = "batch_mean_mse",
         rank_var_weight: float = 0.0,
@@ -90,7 +90,7 @@ class CrossEntropyPlusRankLoss(nn.Module):
         """
         super().__init__()
 
-        self.target_rank_normalized = float(target_rank_normalized)
+        self.target_rank_normalized_distribution = target_rank_normalized_distribution
         self.rank_loss_weight = float(rank_loss_weight)
         self.rank_loss_mode = rank_loss_mode
         self.rank_var_weight = float(rank_var_weight)
@@ -141,21 +141,22 @@ class CrossEntropyPlusRankLoss(nn.Module):
         ce_loss = F.cross_entropy(logits, y, weight=self.class_weight)
 
         # --- L_rank: efficiency / rank loss ---
-        target = torch.tensor(
-            self.target_rank_normalized,
+        B = r_normalized.size(0)
+        target = self.target_rank_normalized_distribution.sample((B,)).to(
             device=r_normalized.device,
             dtype=r_normalized.dtype,
         )
+        target = target.clamp(0.0, 1.0)
 
         mean_r = r_normalized.mean()
 
         if self.rank_loss_mode == "batch_mean_mse":
-            # Controls *average* compute budget
-            rank_loss = (mean_r - target).pow(2)
+            # Make target a scalar budget for the batch
+            target_mean = target.mean()
+            rank_loss = (mean_r - target_mean).pow(2)  # scalar ✅
 
         elif self.rank_loss_mode == "per_sample_mse":
-            # Forces each sample toward target (less dynamic)
-            rank_loss = (r_normalized - target).pow(2).mean()
+            rank_loss = (r_normalized - target).pow(2).mean()  # scalar ✅
 
         else:
             raise ValueError(f"Unknown rank_loss_mode={self.rank_loss_mode}")
@@ -186,7 +187,8 @@ def validate_dynamic_model(
     snr_values=None,
     verbose=True,
     *,
-    max_rank: int = 64,   # used only to report expected rank
+    max_rank: int = 64,        # used to convert r_normalized -> expected rank
+    make_rank_hist: bool = True,
 ):
     """
     Evaluate `model` on the same validation set for different SNR values.
@@ -196,12 +198,12 @@ def validate_dynamic_model(
       - avg accuracy
       - mean normalized rank (ranks_normalized in [0,1])
       - expected rank = 1 + mean_rnorm * (max_rank - 1)
+      - rank histogram over *discrete* ranks (1..max_rank)
 
     Assumes:
       - val_loader.dataset._set_snr(snr) exists
       - val_loader yields (waveforms, labels, meta)
-      - model(waveforms) returns:
-            classif_logits, router_output
+      - model(waveforms) returns: classif_logits, router_output
       - router_output["ranks_normalized"] is continuous in [0,1]
     """
     if snr_values is None:
@@ -209,7 +211,6 @@ def validate_dynamic_model(
 
     model.eval()
     results = {}
-
     ds = val_loader.dataset
 
     with torch.no_grad():
@@ -224,6 +225,9 @@ def validate_dynamic_model(
             # Track mean normalized rank
             total_rnorm = 0.0
 
+            # Rank histogram accumulator (counts for ranks 1..max_rank)
+            rank_hist = torch.zeros(max_rank, dtype=torch.long)  # index 0 -> rank 1
+
             pbar = tqdm(val_loader, desc=f"SNR={snr}", leave=False)
             for waveforms, labels, meta in pbar:
                 waveforms = waveforms.to(device)
@@ -231,12 +235,9 @@ def validate_dynamic_model(
 
                 # ---- Forward ----
                 classif_logits, router_output = model(waveforms)
-                r_normalized = router_output["ranks_normalized"]
+                r_normalized = router_output["ranks_normalized"]  # (B,) or (B,1)
 
                 # ---- Loss ----
-                # Works for both:
-                #  - CrossEntropyLoss(logits, labels)
-                #  - CrossEntropyPlusRankLoss(logits, labels, r_normalized)
                 try:
                     loss_out = criterion(classif_logits, labels, r_normalized)
                     loss = loss_out.loss
@@ -253,7 +254,21 @@ def validate_dynamic_model(
                 # ---- Rank stats ----
                 if r_normalized.dim() == 2 and r_normalized.size(-1) == 1:
                     r_normalized = r_normalized.squeeze(-1)
+
+                r_normalized = r_normalized.clamp(0.0, 1.0)
+
                 total_rnorm += r_normalized.sum().item()
+
+                # Convert normalized rank -> discrete rank in [1, max_rank]
+                # r_cont = 1 + r_norm * (max_rank - 1)
+                # r_hard = round(r_cont)
+                if make_rank_hist:
+                    r_cont = 1.0 + r_normalized * (max_rank - 1)
+                    r_hard = torch.round(r_cont).to(torch.long).clamp(1, max_rank)  # (B,)
+
+                    # Accumulate histogram (cpu for bincount)
+                    counts = torch.bincount(r_hard.cpu() - 1, minlength=max_rank)
+                    rank_hist += counts
 
                 # ---- Progress ----
                 pbar.set_postfix(
@@ -267,19 +282,31 @@ def validate_dynamic_model(
             mean_rnorm = total_rnorm / max(total_samples, 1)
             expected_rank = 1.0 + mean_rnorm * (max_rank - 1)
 
-            results[snr] = {
+            out = {
                 "loss": avg_loss,
                 "acc": avg_acc,
                 "mean_rank_normalized": mean_rnorm,
                 "expected_rank": expected_rank,
             }
 
+            if make_rank_hist:
+                out["rank_hist"] = rank_hist.tolist()          # length max_rank, counts
+                out["rank_hist_bins"] = list(range(1, max_rank + 1))  # explicit bin labels
+                out["rank_hist_probs"] = (rank_hist.float() / max(rank_hist.sum(), 1)).tolist()
+
+            results[snr] = out
+
             if verbose:
-                print(
+                msg = (
                     f"SNR={snr}: "
                     f"loss={avg_loss:.4f}, acc={avg_acc:.2f}%, "
                     f"mean_rnorm={mean_rnorm:.4f}, exp_rank={expected_rank:.2f}"
                 )
+                if make_rank_hist:
+                    # show a quick summary: most common rank
+                    top_rank = int(rank_hist.argmax().item()) + 1
+                    msg += f", mode_rank={top_rank}"
+                print(msg)
 
     return results
 
@@ -389,6 +416,7 @@ def fit_dynamic_model(
                 "loss": f"{loss_out.loss.item():.4f}",
                 "ce": f"{float(loss_out.ce_loss):.4f}",
                 "rank": f"{float(loss_out.rank_loss):.4f}",
+                "rank_var": f"{float(loss_out.rank_variance):.4f}",
                 "exp_r": f"{running_expected_rank:.1f}",
                 "acc": f"{100 * train_correct / train_total:.2f}%"
             })
