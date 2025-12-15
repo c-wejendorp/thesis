@@ -19,7 +19,7 @@ init_learning_rate = 1e-4
 
 maximum_useful_rank = 64
 target_rank_mean = 16
-target_rank_std = 4
+target_rank_std = 8
 
 # Scale factor from rank-space → normalized space
 scale = 1.0 / (maximum_useful_rank - 1)
@@ -65,8 +65,8 @@ router = GRURouter(
     gru_hidden_dim=64,
     num_gru_layers=1,
     max_rank=maximum_useful_rank,
-    last_layer_bias_init= 4.0 # to bias towards full rank at start
-    #last_layer_bias_init= None,
+    #last_layer_bias_init= 4.0 # to bias towards full rank at start
+    last_layer_bias_init= None,
     ).to(device)
 
 
