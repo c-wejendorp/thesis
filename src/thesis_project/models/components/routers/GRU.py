@@ -21,10 +21,10 @@ def sigmoid_ste_rank(logit: torch.Tensor, max_rank: int):
         r_cont: same shape as p, in (1, max_rank)
         r_hard: same shape as p, STE-rounded, clamped to [1, max_rank]
     """
-    p = torch.sigmoid(logit)
-    r_cont = 1 + p * (max_rank - 1)
+    r_normalized = torch.sigmoid(logit)
+    r_cont = 1 + r_normalized * (max_rank - 1)
     r_hard = RoundSTE.apply(r_cont).clamp(1, max_rank) #type: ignore
-    return p, r_cont, r_hard
+    return r_normalized, r_cont, r_hard
 
 class GRURouter(nn.Module):
     def __init__(self, input_dim: int,
@@ -52,12 +52,12 @@ class GRURouter(nn.Module):
         _, h_n = self.gru(x)
         h_last = h_n[-1]                 # (B,H)
 
-        logit = self.fc_out(h_last)      # (B,1)
-        logit = logit.squeeze(-1)        # (B,)
+        logits = self.fc_out(h_last)      # (B,1)
+        logits = logits.squeeze(-1)        # (B,)
 
-        p, r_cont, r = sigmoid_ste_rank(logit, self.max_rank) # (B,), (B,), (B,)
+        ranks_normalized, ranks_cont, ranks = sigmoid_ste_rank(logits, self.max_rank) # (B,), (B,), (B,)
 
-        return {"logit": logit, "p": p, "r_cont": r_cont, "rank": r}
+        return {"logits": logits, "ranks_normalized": ranks_normalized, "ranks_cont": ranks_cont, "ranks": ranks}
     
 # Example usage:
 if __name__ == "__main__":
@@ -65,7 +65,6 @@ if __name__ == "__main__":
     router = GRURouter(F_bins, 128, 64, 1, 64)
     out = router(torch.randn(B, T, F_bins))
 
-    print(out["p"].min().item(), out["p"].max().item())      # should be in (0,1)
-    print(out["rank"].min().item(), out["rank"].max().item())# should be in [1,64]
-    print(out["rank"].unique()[:10])                         # should look integer-ish
-
+    print(out["ranks_normalized"].min().item(), out["ranks_normalized"].max().item())      # should be in (0,1)
+    print(out["ranks"].min().item(), out["ranks"].max().item())# should be in [1,64]
+    print(out["ranks"].unique()[:10])                         # should look integer-ish
