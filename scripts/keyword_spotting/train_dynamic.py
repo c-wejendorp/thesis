@@ -51,7 +51,7 @@ router = GRURouter(
     gru_hidden_dim=64,
     num_gru_layers=1,
     max_rank=maximum_useful_rank,
-    last_layer_bias_init= 4.0 # to bias towards full rank at start
+    last_layer_bias_init= None # to bias towards full rank at start
     ).to(device)
 
 
@@ -76,15 +76,15 @@ train_set = torch.utils.data.Subset(train_set, indices) #type: ignore
 
 train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, pin_memory = pin_memory, num_workers=num_workers)
 
-val_set = SpeechCommandsGoogle(root=str(data_dir), subset="validation", download=True, **noise_eval_cfg.model_dump())
-val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, pin_memory = pin_memory, num_workers=num_workers)
+#val_set = SpeechCommandsGoogle(root=str(data_dir), subset="validation", download=True, **noise_eval_cfg.model_dump())
+#val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, pin_memory = pin_memory, num_workers=num_workers)
 
 # Loss function and optimizer
 criterion = CrossEntropyPlusRankLoss(
     target_rank_normalized=target_rank_normalized,
     rank_loss_weight=1.0,
-    rank_loss_mode="batch_mean_mse",
-    rank_var_weight=0.1,
+    rank_loss_mode="avg_rank",
+    rank_var_weight=0.0,
 )
 optimizer = torch.optim.Adam(model.parameters(), lr=init_learning_rate)
 

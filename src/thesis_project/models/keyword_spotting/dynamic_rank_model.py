@@ -53,4 +53,11 @@ class KWSDynamic(nn.Module):
             ranks=router_output["ranks_cont"],
             x_is_spec=True,
         )
-        return classif_logits, router_output
+        # ---------- KWS branch no grad full rank----------
+        with torch.no_grad():
+            classif_logits_full_rank = self.base.forward(
+                x_spec,
+                ranks=None,  # full rank
+                x_is_spec=True,
+            )
+        return classif_logits, router_output, classif_logits_full_rank

@@ -9,15 +9,14 @@ def ste_rank_mask(r_cont: torch.Tensor, max_rank: int, tau: float, *, device, dt
     returns mask: (B, max_rank) in [0,1] with STE hard forward and soft backward
     """
     r = r_cont.view(-1, 1).to(device=device, dtype=dtype)  # (B,1)
-    k = torch.arange(max_rank, device=device, dtype=dtype).view(1, -1)  # (1,R)
+    k = torch.arange(1, max_rank+1, device=device, dtype=dtype).view(1, -1)  # (1,R)
 
     tau = max(float(tau), 1e-6)
 
-    # boundary at 0.5 makes "rank=1" keep only k=0, etc.
-    soft = torch.sigmoid(((r - 0.5) - k) / tau)                 # (B,R)
-    hard = (k < (r - 0.5)).to(dtype)                             # (B,R)
+    soft = torch.sigmoid(((r + 1e-9) - k) / tau)                 # (B,R)
+    hard = (k < r).to(dtype)                             # (B,R)
 
-    mask = hard + (soft - hard).detach()                         # forward hard, backward soft
+    mask = soft + (hard - soft).detach()                         # forward hard, backward soft
     return mask
 
 class LowRankPointwiseConv1d(nn.Module):
@@ -88,9 +87,6 @@ class LowRankPointwiseConv1d(nn.Module):
             if r_cont.dim() != 1 or r_cont.size(0) != B:
                 raise ValueError(f"`ranks` must have shape (B,) or be an int. Got {tuple(r_cont.shape)} with B={B}.")
 
-        # Keep in valid range
-        r_cont = r_cont.clamp(1.0, float(self.max_rank))
-
         # Project x into rank space using all R components
         SV = (self.S[:, None] * self.V).unsqueeze(-1)   # (R, in, 1)  # type: ignore
         h  = F.conv1d(x, SV, bias=None)                 # (B, R, T)
@@ -99,13 +95,14 @@ class LowRankPointwiseConv1d(nn.Module):
         mask = ste_rank_mask(
             r_cont=r_cont,            # FLOAT ranks -> gradients can flow to router
             max_rank=self.max_rank,
-            tau=0.5,
+            tau=2.0,
             device=h.device,
             dtype=h.dtype,
         )                                               # (B, R)
 
         h = h * mask.unsqueeze(-1)                      # (B, R, T)
-
+        self.mask = mask  # for debugging
+        self.mask.retain_grad()
         # Combine rank components back to out channels
         return F.conv1d(h, self.U.unsqueeze(-1), self.bias)  # type: ignore
 
