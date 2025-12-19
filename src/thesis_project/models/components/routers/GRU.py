@@ -4,27 +4,27 @@ from typing import Optional
 
 
 
-class RoundSTE(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x):
-        return torch.round(x)
+# class RoundSTE(torch.autograd.Function):
+#     @staticmethod
+#     def forward(ctx, x):
+#         return torch.round(x)
 
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output
+#     @staticmethod
+#     def backward(ctx, grad_output):
+#         return grad_output
 
-def sigmoid_ste_rank(logit: torch.Tensor, max_rank: int):
-    """
-    logit: (B,) or (B,1)
-    returns:
-        p:      (B,) or (B,1) in (0,1)
-        r_cont: same shape as p, in (1, max_rank)
-        r_hard: same shape as p, STE-rounded, clamped to [1, max_rank]
-    """
-    r_normalized = torch.sigmoid(logit)
-    r_cont = 1 + r_normalized * (max_rank - 1)
-    r_hard = RoundSTE.apply(r_cont).clamp(1, max_rank) #type: ignore
-    return r_normalized, r_cont, r_hard
+# def sigmoid_ste_rank(logit: torch.Tensor, max_rank: int):
+#     """
+#     logit: (B,) or (B,1)
+#     returns:
+#         p:      (B,) or (B,1) in (0,1)
+#         r_cont: same shape as p, in (1, max_rank)
+#         r_hard: same shape as p, STE-rounded, clamped to [1, max_rank]
+#     """
+#     r_normalized = torch.sigmoid(logit)
+#     r_cont = 1 + r_normalized * (max_rank - 1)
+#     r_hard = RoundSTE.apply(r_cont).clamp(1, max_rank) #type: ignore
+#     return r_normalized, r_cont, r_hard
 
 class GRURouter(nn.Module):
     def __init__(self, input_dim: int,
@@ -54,10 +54,11 @@ class GRURouter(nn.Module):
 
         logits = self.fc_out(h_last)      # (B,1)
         logits = logits.squeeze(-1)        # (B,)
-
-        ranks_normalized, ranks_cont, ranks = sigmoid_ste_rank(logits, self.max_rank) # (B,), (B,), (B,)
-
-        return {"logits": logits, "ranks_normalized": ranks_normalized, "ranks_cont": ranks_cont, "ranks": ranks}
+        #ranks_normalized, ranks_cont, ranks = sigmoid_ste_rank(logits, self.max_rank) # (B,), (B,), (B,)
+        #return {"logits": logits, "ranks_normalized": ranks_normalized, "ranks_cont": ranks_cont, "ranks": ranks}
+        r_normalized = torch.sigmoid(logits)
+        r_cont = 1 + r_normalized * (self.max_rank - 1)
+        return {"logits": logits, "ranks_normalized": r_normalized, "ranks_cont": r_cont}
     
 # Example usage:
 if __name__ == "__main__":

@@ -49,7 +49,8 @@ class KWSDynamic(nn.Module):
         # ---------- KWS branch ----------
         classif_logits = self.base.forward(
             x_spec,
-            ranks=router_output["ranks"],
+            #ranks=router_output["ranks"],
+            ranks=router_output["ranks_cont"],
             x_is_spec=True,
         )
         return classif_logits, router_output

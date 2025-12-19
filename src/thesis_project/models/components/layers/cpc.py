@@ -3,6 +3,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 import warnings
 
+def ste_rank_mask(r_cont: torch.Tensor, max_rank: int, tau: float, *, device, dtype):
+    """
+    r_cont: (B,) or (B,1) continuous in [1, max_rank]
+    returns mask: (B, max_rank) in [0,1] with STE hard forward and soft backward
+    """
+    r = r_cont.view(-1, 1).to(device=device, dtype=dtype)  # (B,1)
+    k = torch.arange(max_rank, device=device, dtype=dtype).view(1, -1)  # (1,R)
+
+    tau = max(float(tau), 1e-6)
+
+    # boundary at 0.5 makes "rank=1" keep only k=0, etc.
+    soft = torch.sigmoid(((r - 0.5) - k) / tau)                 # (B,R)
+    hard = (k < (r - 0.5)).to(dtype)                             # (B,R)
+
+    mask = hard + (soft - hard).detach()                         # forward hard, backward soft
+    return mask
+
 class LowRankPointwiseConv1d(nn.Module):
     def __init__(self, in_channels, out_channels, bias=True):
         super().__init__()
@@ -36,37 +53,61 @@ class LowRankPointwiseConv1d(nn.Module):
     def low_rank_active(self) -> bool:
         return self.S is not None
 
-    def forward(self, x, ranks=None):
+    def forward(self, x: torch.Tensor, ranks=None) -> torch.Tensor:
+        """
+        x:     (B, in_ch, T)
+        ranks: None            -> full conv path
+            int             -> same rank for all samples (kept as float for STE)
+            Tensor/array    -> per-sample continuous ranks (preferred) in [1, max_rank]
+        """
         low_rank_ready = (self.U is not None)  # source of truth
 
         if ranks is not None and not low_rank_ready:
-            raise RuntimeError("ranks was provided, but low-rank is not activated. Call activate_low_rank() first.")
+            raise RuntimeError(
+                "ranks was provided, but low-rank is not activated. Call activate_low_rank() first."
+            )
 
+        # Full-rank path
         if ranks is None:
             return F.conv1d(x, self.weight_full, self.bias)
 
-        # Low-rank path
+        # --- Low-rank path ---
         B = x.size(0)
+        dtype = x.dtype  # keep ranks float and aligned with AMP/fp16 if used
 
+        # Build continuous ranks (float, so router can receive gradients)
         if isinstance(ranks, int):
-            ranks = torch.full((B,), ranks, device=x.device)
-        ranks = torch.as_tensor(ranks, device=x.device).long().clamp(1, self.max_rank)
+            r_cont = torch.full((B,), float(ranks), device=x.device, dtype=dtype)
+        else:
+            r_cont = torch.as_tensor(ranks, device=x.device, dtype=dtype)
 
-        # fast path: all ranks equal
-        if (ranks == ranks[0]).all():
-            r = int(ranks[0].item())
-            SV = (self.S[:r, None] * self.V[:r, :]).unsqueeze(-1)  # (r,in,1) #type: ignore
-            h = F.conv1d(x, SV, bias=None)                         # (B,r,T)
-            return F.conv1d(h, self.U[:, :r].unsqueeze(-1), self.bias) #type: ignore
+            # Allow (B,1) or (B,) shapes
+            if r_cont.dim() == 2 and r_cont.size(-1) == 1:
+                r_cont = r_cont.squeeze(-1)
 
-        # general path: per-sample ranks
-        SV = (self.S[:, None] * self.V).unsqueeze(-1)              # (R,in,1) #type: ignore
-        h = F.conv1d(x, SV, bias=None)                             # (B,R,T)
+            if r_cont.dim() != 1 or r_cont.size(0) != B:
+                raise ValueError(f"`ranks` must have shape (B,) or be an int. Got {tuple(r_cont.shape)} with B={B}.")
 
-        k = torch.arange(self.max_rank, device=x.device)[None, :]
-        h = h * (k < ranks[:, None]).to(h.dtype)[:, :, None]
+        # Keep in valid range
+        r_cont = r_cont.clamp(1.0, float(self.max_rank))
 
-        return F.conv1d(h, self.U.unsqueeze(-1), self.bias) #type: ignore
+        # Project x into rank space using all R components
+        SV = (self.S[:, None] * self.V).unsqueeze(-1)   # (R, in, 1)  # type: ignore
+        h  = F.conv1d(x, SV, bias=None)                 # (B, R, T)
+
+        # STE gating mask (forward hard, backward soft)
+        mask = ste_rank_mask(
+            r_cont=r_cont,            # FLOAT ranks -> gradients can flow to router
+            max_rank=self.max_rank,
+            tau=0.5,
+            device=h.device,
+            dtype=h.dtype,
+        )                                               # (B, R)
+
+        h = h * mask.unsqueeze(-1)                      # (B, R, T)
+
+        # Combine rank components back to out channels
+        return F.conv1d(h, self.U.unsqueeze(-1), self.bias)  # type: ignore
 
 if __name__ == "__main__":
     torch.manual_seed(0)

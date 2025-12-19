@@ -71,8 +71,8 @@ data_dir = get_data_dir()
 train_set = SpeechCommandsGoogle(root=str(data_dir), subset="training", download=True, **noise_train_cfg.model_dump())
 
 # only usee 1000 random samples for quick testing
-# indices = np.random.choice(len(train_set), size=1000, replace=False)
-# train_set = torch.utils.data.Subset(train_set, indices) #type: ignore
+indices = np.random.choice(len(train_set), size=1000, replace=False)
+train_set = torch.utils.data.Subset(train_set, indices) #type: ignore
 
 train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, pin_memory = pin_memory, num_workers=num_workers)
 
@@ -84,7 +84,7 @@ criterion = CrossEntropyPlusRankLoss(
     target_rank_normalized=target_rank_normalized,
     rank_loss_weight=1.0,
     rank_loss_mode="batch_mean_mse",
-    rank_var_weight=0.0,
+    rank_var_weight=0.1,
 )
 optimizer = torch.optim.Adam(model.parameters(), lr=init_learning_rate)
 
