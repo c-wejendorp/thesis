@@ -453,6 +453,7 @@ def fit_dynamic_model(
             "best_train_loss": best_train_loss,
             # Track loss weights if you anneal them
             "rank_loss_weight": getattr(criterion, "rank_loss_weight", None),
+            "rank_var_weight": getattr(criterion, "rank_var_weight", None),
         }
         history["epochs_log"].append(epoch_log)
         print(f"\nEpoch {epoch+1}/{epochs} Summary:")
