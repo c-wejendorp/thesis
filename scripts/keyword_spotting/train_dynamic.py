@@ -19,7 +19,7 @@ init_learning_rate = 1e-4
 
 maximum_useful_rank = 64
 target_rank = 16
-target_rank_normalized = (target_rank - 1) / (maximum_useful_rank - 1)
+target_rank_normalized = (target_rank - 1) / (maximum_useful_rank - 1) # normalize to [0, 1] range
 
 torch.manual_seed(42)
 np.random.seed(42)
@@ -84,7 +84,7 @@ criterion = CrossEntropyPlusRankLoss(
     target_rank_normalized=target_rank_normalized,
     rank_loss_weight=1.0,
     rank_loss_mode="batch_mean_mse",
-    rank_var_weight=0.1,
+    rank_var_weight=0.0,
 )
 optimizer = torch.optim.Adam(model.parameters(), lr=init_learning_rate)
 
