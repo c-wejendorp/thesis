@@ -79,7 +79,7 @@ class KWSBase(nn.Module):
         x_spec = self.spectrogram(x)  # (B, n_channels_in_waveform, spec_bins, T)
         return x_spec.squeeze(1)         # (B, spec_bins, T) # remove channel dim (mono)
     
-    def forward(self, x: torch.Tensor, ranks: torch.Tensor | int | None = None, x_is_spec: bool = False) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, ranks: torch.Tensor | int | None = None, x_is_spec: bool = False, return_embedding: bool = False) -> torch.Tensor:
         """
         Forward pass for the KeyWordSpottingModel.
 
@@ -116,6 +116,8 @@ class KWSBase(nn.Module):
         # --- Classifier ---
         x = x.mean(dim=-1) #  Global pooling across time (collapse temporal dimension)
         logits = self.classifier(x) # (B, num_classes)
+        if return_embedding:
+            return logits, x #type: ignore
         return logits
     
     def _iter_low_rank_in_module(self, module: nn.Module):

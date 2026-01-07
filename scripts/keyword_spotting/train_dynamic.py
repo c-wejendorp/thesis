@@ -14,8 +14,8 @@ from thesis_project.training.key_word_spotting import CrossEntropyPlusRankLoss, 
 #TODO: Should not be hardcoded here
 # Training configuration
 batch_size = 64
-num_epochs = 30
-init_learning_rate = 1e-4
+num_epochs = 60
+init_learning_rate = 1e-5
 
 maximum_useful_rank = 64
 target_rank = 16
@@ -58,7 +58,7 @@ router = GRURouter(
 n_trainable_router = sum(p.numel() for p in router.parameters() if p.requires_grad)
 print(f"Router trainable params: {n_trainable_router}")
 
-model = KWSDynamic(base=base_model, router=router).to(device)
+model = KWSDynamic(base=base_model, router=router,freeze_base=True).to(device)
 
 n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
 n_total = sum(p.numel() for p in model.parameters())
