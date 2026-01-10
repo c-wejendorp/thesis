@@ -61,3 +61,9 @@ class KWSDynamic(nn.Module):
                 x_is_spec=True,
             )
         return classif_logits, router_output, classif_logits_full_rank
+    
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.freeze_base:
+            self.base.eval()   # keep BN/Dropout fixed
+        return self
