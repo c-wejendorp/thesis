@@ -251,7 +251,8 @@ def validate_dynamic_model(
                 labels = labels.to(device)
 
                 # ---- Forward ----
-                classif_logits, router_output = model(waveforms)
+                classif_logits, router_output, classif_logits_full_rank = model(waveforms)
+                #classif_logits, router_output = model(waveforms)
                 r_normalized = router_output["ranks_normalized"]  # (B,) or (B,1)
 
                 # ---- Loss ----
@@ -333,6 +334,7 @@ def fit_dynamic_model(
     *,
     model: nn.Module,
     train_loader,
+    val_loader=None,
     optimizer: torch.optim.Optimizer,
     criterion: nn.Module,  # CrossEntropyPlusRankLoss(...)
     device: torch.device,
@@ -340,9 +342,11 @@ def fit_dynamic_model(
     scheduler: Optional[Any] = None,
     run_dir: Optional[str] = None,
     max_rank: int = 64,  # used only for reporting expected rank
+    val_snr_values=None,  # SNR values to use during validation
+    main_val_snr=None,  # SNR to use for best model selection; if None, use mean across all SNRs
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     """
-    Train-only loop for your dynamic model (no validation yet), matching the base-model
+    Training loop for your dynamic model with optional validation, matching the base-model
     tqdm style + variable names.
 
     Assumptions:
@@ -377,6 +381,7 @@ def fit_dynamic_model(
     }
 
     best_train_loss = float("inf")
+    best_val_loss = float("inf")
 
     for epoch in range(epochs):
 
@@ -456,11 +461,52 @@ def fit_dynamic_model(
         train_rank_variance_epoch = train_rank_variance / denom
         train_expected_rank_epoch = train_mean_rank_normalized_epoch * float(max_rank)
 
+        # ===============================
+        # --------- VALIDATION ----------
+        # ===============================
+        val_results = None
+        val_loss_epoch = None
+        val_acc_epoch = None
+        val_mean_rank_normalized_epoch = None
+        val_expected_rank_epoch = None
 
+        if val_loader is not None:
+            val_results = validate_dynamic_model(
+                model=model,
+                val_loader=val_loader,
+                criterion=criterion,
+                device=device,
+                snr_values=val_snr_values,
+                verbose=False,
+                max_rank=max_rank,
+                make_rank_hist=False,
+            )
+            # Determine which SNR to use for best model selection
+            if main_val_snr is not None and main_val_snr in val_results:
+                # Use specified SNR
+                primary_val = val_results[main_val_snr]
+                val_loss_epoch = primary_val["loss"]
+                val_acc_epoch = primary_val["acc"]
+                val_mean_rank_normalized_epoch = primary_val["mean_rank_normalized"]
+                val_expected_rank_epoch = primary_val["expected_rank"]
+            else:
+                # Use mean across all SNR values
+                all_snrs = list(val_results.keys())
+                val_loss_epoch = sum(val_results[s]["loss"] for s in all_snrs) / len(all_snrs)
+                val_acc_epoch = sum(val_results[s]["acc"] for s in all_snrs) / len(all_snrs)
+                val_mean_rank_normalized_epoch = sum(val_results[s]["mean_rank_normalized"] for s in all_snrs) / len(all_snrs)
+                val_expected_rank_epoch = sum(val_results[s]["expected_rank"] for s in all_snrs) / len(all_snrs)
 
-        # Save "best" based on training loss (temporary until validation exists)
-        if train_loss_epoch < best_train_loss:
-            best_train_loss = train_loss_epoch
+        # Save "best" based on validation loss (or training loss if no validation)
+        use_val_for_best = val_loader is not None and val_loss_epoch is not None
+        current_metric = val_loss_epoch if use_val_for_best else train_loss_epoch
+        best_metric = best_val_loss if use_val_for_best else best_train_loss
+
+        if current_metric < best_metric: #type: ignore
+            if use_val_for_best:
+                best_val_loss = current_metric
+            else:
+                best_train_loss = current_metric
 
             torch.save(
                 {
@@ -477,6 +523,12 @@ def fit_dynamic_model(
                         "rank_variance": train_rank_variance_epoch,
                         "expected_rank": train_expected_rank_epoch,
                     },
+                    "val_metrics": {
+                        "loss": val_loss_epoch,
+                        "acc": val_acc_epoch,
+                        "mean_rank_normalized": val_mean_rank_normalized_epoch,
+                        "expected_rank": val_expected_rank_epoch,
+                    } if val_loader is not None else None,
                     # Helpful for reproducibility/debug:
                     "rank_loss_weight": getattr(criterion, "rank_loss_weight", None),
                     "target_rank_normalized": getattr(criterion, "target_rank_normalized", None),
@@ -496,6 +548,13 @@ def fit_dynamic_model(
             "train_rank_variance": train_rank_variance_epoch,
             "train_expected_rank": train_expected_rank_epoch,
             "best_train_loss": best_train_loss,
+            # Validation metrics
+            "val_loss": val_loss_epoch,
+            "val_acc": val_acc_epoch,
+            "val_mean_rank_normalized": val_mean_rank_normalized_epoch,
+            "val_expected_rank": val_expected_rank_epoch,
+            "best_val_loss": best_val_loss if val_loader is not None else None,
+            "val_results_all_snr": val_results,
             # Track loss weights if you anneal them
             "rank_loss_weight": getattr(criterion, "rank_loss_weight", None),
             "rank_var_weight": getattr(criterion, "rank_var_weight", None),
@@ -505,6 +564,9 @@ def fit_dynamic_model(
         print(f"  Train Loss: {train_loss_epoch:.4f}   CE Loss: {train_ce_loss_epoch:.4f}   Rank Loss: {train_rank_loss_epoch:.4f}")
         print(f"  Train Acc: {train_acc_epoch:.2f}%")
         print(f"  Expected Rank: {train_expected_rank_epoch:.2f} / {max_rank}   Rank Variance: {train_rank_variance_epoch:.6f}")
+        if val_loader is not None:
+            print(f"  Val Loss: {val_loss_epoch:.4f}   Val Acc: {val_acc_epoch:.2f}%")
+            print(f"  Val Expected Rank: {val_expected_rank_epoch:.2f} / {max_rank}")
 
 
         # Save history each epoch (so crashes still leave logs)
