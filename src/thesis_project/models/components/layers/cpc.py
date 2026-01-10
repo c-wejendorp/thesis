@@ -8,13 +8,13 @@ def ste_rank_mask(r_cont: torch.Tensor, max_rank: int, tau: float, *, device, dt
     r_cont: (B,) or (B,1) continuous in [1, max_rank]
     returns mask: (B, max_rank) in [0,1] with STE hard forward and soft backward
     """
-    r = r_cont.view(-1, 1).to(device=device, dtype=dtype)  # (B,1)
+    r_cont = r_cont.view(-1, 1).to(device=device, dtype=dtype)  # (B,1)
     k = torch.arange(1, max_rank+1, device=device, dtype=dtype).view(1, -1)  # (1,R)
 
     tau = max(float(tau), 1e-6)
 
-    soft = torch.sigmoid(((r + 1e-9) - k) / tau)                 # (B,R)
-    hard = (k < r).to(dtype)                             # (B,R)
+    soft = torch.sigmoid(((r_cont + 1e-9) - k) / tau)                 # (B,R)
+    hard = (k <= r_cont).to(dtype)                             # (B,R) using <=
 
     mask = soft + (hard - soft).detach()                         # forward hard, backward soft
     return mask
@@ -95,14 +95,14 @@ class LowRankPointwiseConv1d(nn.Module):
         mask = ste_rank_mask(
             r_cont=r_cont,            # FLOAT ranks -> gradients can flow to router
             max_rank=self.max_rank,
-            tau=2.0,
+            tau=0.1,
             device=h.device,
             dtype=h.dtype,
         )                                               # (B, R)
 
         h = h * mask.unsqueeze(-1)                      # (B, R, T)
-        self.mask = mask  # for debugging
-        self.mask.retain_grad()
+        #self.mask = mask  # for debugging
+        #self.mask.retain_grad()
         # Combine rank components back to out channels
         return F.conv1d(h, self.U.unsqueeze(-1), self.bias)  # type: ignore
 
