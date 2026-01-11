@@ -36,6 +36,7 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
         use_silence: bool = True,
         upsample: bool = False,
         seed: int = 789,
+        seed_deterministic_noise: Optional[int] = None,
         transform=None,
         add_noise: bool = True,
         noise_prob: float = 0.9,
@@ -55,6 +56,8 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
         self.use_silence = use_silence
         self.upsample = upsample
         self.seed = seed
+        self.seed_deterministic_noise = (
+            seed if seed_deterministic_noise is None else seed_deterministic_noise)
 
         self.transform = transform if transform is not None else PadOrTrim()
 
@@ -237,7 +240,7 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
                 noise_paths=self.noise_paths,
                 target_length=TARGET_LENGTH,
                 sample_rate=SAMPLE_RATE,
-                seed=self.seed,
+                seed=self.seed_deterministic_noise,
             )
         
         # ---------- Label mapping ----------
