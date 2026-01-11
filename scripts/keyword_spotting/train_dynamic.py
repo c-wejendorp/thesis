@@ -82,8 +82,8 @@ train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, pin_me
 # Loss function and optimizer
 criterion = CrossEntropyPlusRankLoss(
     target_rank_normalized=target_rank_normalized,
-    rank_loss_weight=1.0,
-    rank_loss_mode="avg_rank",
+    rank_loss_weight=5.0,
+    rank_loss_mode="per_sample_mse",
     rank_var_weight=0.0,
 )
 optimizer = torch.optim.Adam(model.parameters(), lr=init_learning_rate)
@@ -107,4 +107,5 @@ model, history = fit_dynamic_model(
     scheduler=scheduler,
     run_dir=None, # automatically create timestamped folder, but can be set customly
     max_rank=maximum_useful_rank,
+    k_rank_samples=20,
 )

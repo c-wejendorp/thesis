@@ -24,6 +24,10 @@ class CrossEntropyRankLossOut:
         rank_loss:
             Rank / efficiency loss term (detached).
 
+        rank_target_loss:
+            Per-sample rank target supervision loss (detached).
+            Only non-zero if target_rank_normalized is provided.
+
         mean_rank_normalized:
             Mean of r_normalized over the batch.
             Multiply by max_rank to get expected rank.
@@ -45,11 +49,13 @@ class CrossEntropyPlusRankLoss(nn.Module):
     Total loss:
         L_total = L_ce
                 + rank_loss_weight * L_rank
+                + rank_target_loss_weight * L_rank_target
                 - rank_var_weight  * Var(r_normalized)
 
     where:
         - L_ce   : cross-entropy classification loss
         - L_rank : rank / compute budget loss
+        - L_rank_target : per-sample MSE between router output and target rank
     """
 
     def __init__(
@@ -95,7 +101,6 @@ class CrossEntropyPlusRankLoss(nn.Module):
         self.rank_loss_weight = float(rank_loss_weight)
         self.rank_loss_mode = rank_loss_mode
         self.rank_var_weight = float(rank_var_weight)
-
         # Register CE weights so they follow device placement
         if class_weight is not None:
             self.register_buffer("class_weight", class_weight)
@@ -108,6 +113,7 @@ class CrossEntropyPlusRankLoss(nn.Module):
         y: torch.Tensor,
         r_normalized: torch.Tensor,
         classif_logits_full_rank: Optional[torch.Tensor] = None,
+        target_rank_normalized: Optional[torch.Tensor] = None,
 
     ) -> CrossEntropyRankLossOut:
         """
@@ -121,6 +127,10 @@ class CrossEntropyPlusRankLoss(nn.Module):
             r_normalized:
                 (B,) or (B,1) continuous normalized rank in [0,1].
                 IMPORTANT: pass the *continuous* value (not STE-rounded ranks).
+
+            target_rank_normalized:
+                (B,) optional per-sample target rank in [0,1].
+                If provided and rank_target_loss_weight > 0, adds MSE supervision.
 
         Returns:
             CrossEntropyRankLossOut
@@ -146,7 +156,7 @@ class CrossEntropyPlusRankLoss(nn.Module):
 
         # --- L_rank: efficiency / rank loss ---
         target = torch.tensor(
-            self.target_rank_normalized,
+            self.target_rank_normalized if target_rank_normalized is None else target_rank_normalized.detach().clone(),
             device=r_normalized.device,
             dtype=r_normalized.dtype,
         )
@@ -344,6 +354,7 @@ def fit_dynamic_model(
     max_rank: int = 64,  # used only for reporting expected rank
     val_snr_values=None,  # SNR values to use during validation
     main_val_snr=None,  # SNR to use for best model selection; if None, use mean across all SNRs
+    k_rank_samples: int = 0,  # number of random ranks to sample per sample for target supervision
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     """
     Training loop for your dynamic model with optional validation, matching the base-model
@@ -356,6 +367,12 @@ def fit_dynamic_model(
       - criterion(logits, labels, r_normalized) returns CrossEntropyRankLossOut with:
           .loss (scalar for backprop),
           .ce_loss, .rank_loss, .mean_rank_normalized, .rank_variance (detached tensors)
+
+    New rank-target supervision (when k_rank_samples > 0):
+      - For each sample in the batch, sample k random ranks from [1, max_rank]
+      - Run the base model at each rank to get predictions
+      - Find the minimum rank where prediction is correct (or max_rank if never correct)
+      - Use this as a supervision target for the router
 
     Saving (temporary, since no validation):
       - best_model.pth: saved when *training loss* improves
@@ -376,6 +393,7 @@ def fit_dynamic_model(
         "config": {
             "epochs": epochs,
             "max_rank": max_rank,
+            "k_rank_samples": k_rank_samples,
         },
         "epochs_log": [],
     }
@@ -394,6 +412,7 @@ def fit_dynamic_model(
         train_loss = 0.0
         train_ce_loss = 0.0
         train_rank_loss = 0.0
+        train_rank_target_loss = 0.0
         train_mean_rank_normalized = 0.0
         train_rank_variance = 0.0
 
@@ -410,8 +429,71 @@ def fit_dynamic_model(
             classif_logits, router_output, classif_logits_full_rank = model(waveforms)
 
             r_normalized = router_output["ranks_normalized"]
+            r_cont_ceiled = 1 + r_normalized * (max_rank - 1)
 
-            loss_out = criterion(classif_logits, labels, r_normalized, classif_logits_full_rank=classif_logits_full_rank)
+            # --- Compute rank target (if enabled) ---
+            target_rank_normalized = None
+            if k_rank_samples > 0:
+                batch_size = waveforms.size(0)
+                
+                # Compute spectrogram once (reuse for all rank samples)
+                with torch.no_grad():
+                    x_spec = model.base.compute_spectrogram(waveforms)  # (B, spec_bins, T)
+                
+                # Sample k random ranks for each sample in batch: (B, k)
+                # Ranks are integers in [1, ceil(r_cont_ceiled)] - sample below current router output
+                r_cont_ceiled_clamped = r_cont_ceiled.detach().ceil().clamp(min=1, max=max_rank).long()  # (B,) or (B,1)
+                if r_cont_ceiled_clamped.dim() == 2:
+                    r_cont_ceiled_clamped = r_cont_ceiled_clamped.squeeze(-1)
+                # Sample uniformly from [1, r_cont_ceiled_clamped] for each sample
+                sampled_ranks = torch.stack([
+                    torch.randint(1, r_ceil.item() + 1, (k_rank_samples,), device=device)
+                    for r_ceil in r_cont_ceiled_clamped
+                ], dim=0)  # (B, k)
+                
+                # Track minimum correct rank per sample (initialize to max_rank + 1 = "never correct")
+                min_correct_rank = torch.full((batch_size,), max_rank + 1, dtype=torch.float32, device=device)
+                
+                # Evaluate each sampled rank
+                with torch.no_grad():
+                    for k_idx in range(k_rank_samples):
+                        ranks_k = sampled_ranks[:, k_idx]  # (B,)
+                        
+                        # Run base model at these ranks
+                        logits_k = model.base.forward(x_spec, ranks=ranks_k, x_is_spec=True)
+                        preds_k = logits_k.argmax(dim=1)  # (B,)
+                        
+                        # Check correctness
+                        correct_k = (preds_k == labels).float()  # (B,) 1.0 if correct, 0.0 if not
+                        
+                        # Update min_correct_rank where this rank is correct and lower than current min
+                        is_correct_and_lower = (correct_k == 1.0) & (ranks_k.float() < min_correct_rank)
+                        min_correct_rank = torch.where(is_correct_and_lower, ranks_k.float(), min_correct_rank)
+                
+                # Identify samples that were never correct at any sampled rank
+                never_correct_mask = (min_correct_rank > max_rank)
+                
+                # For never-correct samples, set target to router's current output (no gradient push)
+                # For correct samples, use the min_correct_rank
+                min_correct_rank = torch.where(
+                    never_correct_mask,
+                    r_cont_ceiled.detach().squeeze(-1) if r_cont_ceiled.dim() == 2 else r_cont_ceiled.detach(),
+                    min_correct_rank
+                )
+                
+                # Normalize target to [0, 1] range (same as router output)
+                # r_normalized = (rank - 1) / (max_rank - 1)
+                target_rank_normalized = (min_correct_rank - 1) / (max_rank - 1)
+
+            # --- Compute loss (passes target to criterion if available) ---
+            loss_out = criterion(
+                classif_logits, 
+                labels, 
+                r_normalized, 
+                classif_logits_full_rank=classif_logits_full_rank,
+                target_rank_normalized=target_rank_normalized,
+            )
+
             loss_out.loss.backward()
             optimizer.step()
 
@@ -455,6 +537,7 @@ def fit_dynamic_model(
         train_loss_epoch = train_loss / denom
         train_ce_loss_epoch = train_ce_loss / denom
         train_rank_loss_epoch = train_rank_loss / denom
+        train_rank_target_loss_epoch = train_rank_target_loss / denom
         train_acc_epoch = 100.0 * train_correct / denom
 
         train_mean_rank_normalized_epoch = train_mean_rank_normalized / denom
@@ -518,6 +601,7 @@ def fit_dynamic_model(
                         "loss": train_loss_epoch,
                         "ce_loss": train_ce_loss_epoch,
                         "rank_loss": train_rank_loss_epoch,
+                        "rank_target_loss": train_rank_target_loss_epoch,
                         "acc": train_acc_epoch,
                         "mean_rank_normalized": train_mean_rank_normalized_epoch,
                         "rank_variance": train_rank_variance_epoch,
@@ -534,6 +618,7 @@ def fit_dynamic_model(
                     "target_rank_normalized": getattr(criterion, "target_rank_normalized", None),
                     "rank_loss_mode": getattr(criterion, "rank_loss_mode", None),
                     "rank_var_weight": getattr(criterion, "rank_var_weight", None),
+                    "rank_target_loss_weight": getattr(criterion, "rank_target_loss_weight", None),
                 },
                 model_path,
             )
@@ -543,6 +628,7 @@ def fit_dynamic_model(
             "train_loss": train_loss_epoch,
             "train_ce_loss": train_ce_loss_epoch,
             "train_rank_loss": train_rank_loss_epoch,
+            "train_rank_target_loss": train_rank_target_loss_epoch,
             "train_acc": train_acc_epoch,
             "train_mean_rank_normalized": train_mean_rank_normalized_epoch,
             "train_rank_variance": train_rank_variance_epoch,
@@ -558,10 +644,13 @@ def fit_dynamic_model(
             # Track loss weights if you anneal them
             "rank_loss_weight": getattr(criterion, "rank_loss_weight", None),
             "rank_var_weight": getattr(criterion, "rank_var_weight", None),
+            "rank_target_loss_weight": getattr(criterion, "rank_target_loss_weight", None),
         }
         history["epochs_log"].append(epoch_log)
         print(f"\nEpoch {epoch+1}/{epochs} Summary:")
         print(f"  Train Loss: {train_loss_epoch:.4f}   CE Loss: {train_ce_loss_epoch:.4f}   Rank Loss: {train_rank_loss_epoch:.4f}")
+        if k_rank_samples > 0:
+            print(f"  Rank Target Loss: {train_rank_target_loss_epoch:.4f} (k={k_rank_samples}, weight={getattr(criterion, 'rank_target_loss_weight', 0.0)})")
         print(f"  Train Acc: {train_acc_epoch:.2f}%")
         print(f"  Expected Rank: {train_expected_rank_epoch:.2f} / {max_rank}   Rank Variance: {train_rank_variance_epoch:.6f}")
         if val_loader is not None:
