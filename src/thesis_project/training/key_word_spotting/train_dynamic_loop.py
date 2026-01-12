@@ -23,11 +23,7 @@ class CrossEntropyRankLossOut:
 
         rank_loss:
             Rank / efficiency loss term (detached).
-
-        rank_target_loss:
-            Per-sample rank target supervision loss (detached).
-            Only non-zero if target_rank_normalized is provided.
-
+            
         mean_rank_normalized:
             Mean of r_normalized over the batch.
             Multiply by max_rank to get expected rank.
@@ -63,10 +59,10 @@ class CrossEntropyPlusRankLoss(nn.Module):
         *,
         target_rank_normalized: float,
         rank_loss_weight: float,
-        rank_loss_mode: Literal["batch_mean_mse", "per_sample_mse","avg_rank","riccardo_special"] = "batch_mean_mse",
+        rank_loss_mode: Literal["batch_mean_mse", "per_sample_mse","avg_rank","riccardo_special","asymmetric_mse"] = "batch_mean_mse",
         rank_var_weight: float = 0.0,
         class_weight: Optional[torch.Tensor] = None,
-
+        asymmetric_alpha: float = 2.0,
     ):
         """
         Args:
@@ -88,6 +84,18 @@ class CrossEntropyPlusRankLoss(nn.Module):
                     Enforces per-sample closeness to target
                     (discourages dynamic spread).
 
+                - "asymmetric_mse":
+                    Penalizes ranks above target more strongly than below.
+                    Uses asymmetric_alpha to control the asymmetry:
+                    alpha * error^2 if error > 0, else error^2
+                    This encourages the distribution tail towards lower ranks.
+                    Works with both scalar and per-sample tensor targets.
+
+            asymmetric_alpha:
+                Multiplier for penalty when rank exceeds target (only used
+                with "asymmetric_mse" mode). Default 2.0 means overshooting
+                the target is penalized 2x more than undershooting.
+
             rank_var_weight:
                 Weight for variance encouragement term.
                 Higher → stronger push against router collapse.
@@ -101,6 +109,7 @@ class CrossEntropyPlusRankLoss(nn.Module):
         self.rank_loss_weight = float(rank_loss_weight)
         self.rank_loss_mode = rank_loss_mode
         self.rank_var_weight = float(rank_var_weight)
+        self.asymmetric_alpha = float(asymmetric_alpha)
         # Register CE weights so they follow device placement
         if class_weight is not None:
             self.register_buffer("class_weight", class_weight)
@@ -155,11 +164,17 @@ class CrossEntropyPlusRankLoss(nn.Module):
         ce_loss = ce_loss_pr_sample.mean()
 
         # --- L_rank: efficiency / rank loss ---
-        target = torch.tensor(
-            self.target_rank_normalized if target_rank_normalized is None else target_rank_normalized.detach().clone(),
-            device=r_normalized.device,
-            dtype=r_normalized.dtype,
-        )
+        if target_rank_normalized is None:
+            target = torch.tensor(
+                self.target_rank_normalized,
+                device=r_normalized.device,
+                dtype=r_normalized.dtype,
+            )
+        else:
+            target = target_rank_normalized.detach().clone().to(
+                device=r_normalized.device,
+                dtype=r_normalized.dtype,
+            )
 
         temp = 0.2  # temperature for riccardo_special
 
@@ -184,6 +199,16 @@ class CrossEntropyPlusRankLoss(nn.Module):
             #weights = torch.softmax(-ce_loss_pr_sample.detach()/temp, dim=0)
             weights *= len(weights)  # normalize to batch size
             rank_loss = (weights * r_normalized).mean()
+
+        elif self.rank_loss_mode == "asymmetric_mse":
+            # Penalize exceeding target more than undershooting
+            # This pushes the distribution tail towards lower ranks
+            error = r_normalized - target
+            rank_loss = torch.where(
+                error > 0,
+                self.asymmetric_alpha * error.pow(2),  # stronger penalty for overshooting
+                error.pow(2),                          # normal penalty for undershooting
+            ).mean()
 
         else:
             raise ValueError(f"Unknown rank_loss_mode={self.rank_loss_mode}")
@@ -354,7 +379,7 @@ def fit_dynamic_model(
     max_rank: int = 64,  # used only for reporting expected rank
     val_snr_values=None,  # SNR values to use during validation
     main_val_snr=None,  # SNR to use for best model selection; if None, use mean across all SNRs
-    k_rank_samples: int = 0,  # number of random ranks to sample per sample for target supervision
+    enable_rank_supervision: bool = False,  # if True, find min correct rank and use as target
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     """
     Training loop for your dynamic model with optional validation, matching the base-model
@@ -368,11 +393,10 @@ def fit_dynamic_model(
           .loss (scalar for backprop),
           .ce_loss, .rank_loss, .mean_rank_normalized, .rank_variance (detached tensors)
 
-    New rank-target supervision (when k_rank_samples > 0):
-      - For each sample in the batch, sample k random ranks from [1, max_rank]
-      - Run the base model at each rank to get predictions
-      - Find the minimum rank where prediction is correct (or max_rank if never correct)
-      - Use this as a supervision target for the router
+    New rank-target supervision (when enable_rank_supervision=True):
+      - For each sample, test all ranks from 1 to router's current suggestion
+      - Find the minimum rank where prediction is correct
+      - Use this as a supervision target for the router (requires per_sample_mse mode)
 
     Saving (temporary, since no validation):
       - best_model.pth: saved when *training loss* improves
@@ -393,7 +417,7 @@ def fit_dynamic_model(
         "config": {
             "epochs": epochs,
             "max_rank": max_rank,
-            "k_rank_samples": k_rank_samples,
+            "enable_rank_supervision": enable_rank_supervision,
         },
         "epochs_log": [],
     }
@@ -412,7 +436,6 @@ def fit_dynamic_model(
         train_loss = 0.0
         train_ce_loss = 0.0
         train_rank_loss = 0.0
-        train_rank_target_loss = 0.0
         train_mean_rank_normalized = 0.0
         train_rank_variance = 0.0
 
@@ -429,48 +452,66 @@ def fit_dynamic_model(
             classif_logits, router_output, classif_logits_full_rank = model(waveforms)
 
             r_normalized = router_output["ranks_normalized"]
-            r_cont_ceiled = 1 + r_normalized * (max_rank - 1)
+            r_cont_ceiled = torch.ceil(router_output["ranks_cont"])  # continuous rank, ceiled
 
             # --- Compute rank target (if enabled) ---
+            # When enable_rank_supervision=True, we test ALL ranks from 1 up to
+            # the router's current suggestion for each sample, and find the
+            # minimum rank that gives a correct prediction. This target is then
+            # used to supervise the router via the rank_loss (per_sample_mse mode).
+            #
+            # Gradient flow: The target is detached (fixed), but r_normalized
+            # (router output) has gradients. The loss (r_normalized - target)^2
+            # pushes the router toward outputting the discovered min correct rank.
             target_rank_normalized = None
-            if k_rank_samples > 0:
+            if enable_rank_supervision:
                 batch_size = waveforms.size(0)
                 
-                # Compute spectrogram once (reuse for all rank samples)
+                # Compute spectrogram once (reuse for all rank evaluations)
                 with torch.no_grad():
                     x_spec = model.base.compute_spectrogram(waveforms)  # (B, spec_bins, T)
                 
-                # Sample k random ranks for each sample in batch: (B, k)
-                # Ranks are integers in [1, ceil(r_cont_ceiled)] - sample below current router output
+                # Get the router's current suggestion (ceiled to integer)
                 r_cont_ceiled_clamped = r_cont_ceiled.detach().ceil().clamp(min=1, max=max_rank).long()  # (B,) or (B,1)
                 if r_cont_ceiled_clamped.dim() == 2:
-                    r_cont_ceiled_clamped = r_cont_ceiled_clamped.squeeze(-1)
-                # Sample uniformly from [1, r_cont_ceiled_clamped] for each sample
-                sampled_ranks = torch.stack([
-                    torch.randint(1, r_ceil.item() + 1, (k_rank_samples,), device=device)
-                    for r_ceil in r_cont_ceiled_clamped
-                ], dim=0)  # (B, k)
+                    r_cont_ceiled_clamped = r_cont_ceiled_clamped.squeeze(-1)  # (B,)
                 
                 # Track minimum correct rank per sample (initialize to max_rank + 1 = "never correct")
                 min_correct_rank = torch.full((batch_size,), max_rank + 1, dtype=torch.float32, device=device)
                 
-                # Evaluate each sampled rank
+                # Test ALL ranks from 1 up to router's suggestion for each sample
+                # We iterate through ranks 1 to max(r_cont_ceiled_clamped) and use masking
+                max_router_rank = r_cont_ceiled_clamped.max().item()  # max rank we need to test
+                
                 with torch.no_grad():
-                    for k_idx in range(k_rank_samples):
-                        ranks_k = sampled_ranks[:, k_idx]  # (B,)
+                    for rank_val in range(1, int(max_router_rank) + 1):
+                        # Create mask: which samples have router suggestion >= current rank_val
+                        # (i.e., we should test this rank for these samples)
+                        sample_mask = (r_cont_ceiled_clamped >= rank_val)  # (B,)
                         
-                        # Run base model at these ranks
-                        logits_k = model.base.forward(x_spec, ranks=ranks_k, x_is_spec=True)
+                        if not sample_mask.any():
+                            continue  # no samples need this rank tested
+                        
+                        # Run base model at this rank for ALL samples (simpler than masked forward)
+                        ranks_tensor = torch.full((batch_size,), rank_val, dtype=torch.long, device=device)
+                        logits_k = model.base.forward(x_spec, ranks=ranks_tensor, x_is_spec=True)
                         preds_k = logits_k.argmax(dim=1)  # (B,)
                         
                         # Check correctness
-                        correct_k = (preds_k == labels).float()  # (B,) 1.0 if correct, 0.0 if not
+                        correct_k = (preds_k == labels)  # (B,) bool
                         
-                        # Update min_correct_rank where this rank is correct and lower than current min
-                        is_correct_and_lower = (correct_k == 1.0) & (ranks_k.float() < min_correct_rank)
-                        min_correct_rank = torch.where(is_correct_and_lower, ranks_k.float(), min_correct_rank)
+                        # Update min_correct_rank where:
+                        # 1. This sample should be tested at this rank (sample_mask)
+                        # 2. Prediction is correct
+                        # 3. This rank is lower than current min
+                        should_update = sample_mask & correct_k & (rank_val < min_correct_rank)
+                        min_correct_rank = torch.where(
+                            should_update,
+                            torch.tensor(rank_val, dtype=torch.float32, device=device),
+                            min_correct_rank
+                        )
                 
-                # Identify samples that were never correct at any sampled rank
+                # Identify samples that were never correct at any tested rank
                 never_correct_mask = (min_correct_rank > max_rank)
                 
                 # For never-correct samples, set target to router's current output (no gradient push)
@@ -537,7 +578,6 @@ def fit_dynamic_model(
         train_loss_epoch = train_loss / denom
         train_ce_loss_epoch = train_ce_loss / denom
         train_rank_loss_epoch = train_rank_loss / denom
-        train_rank_target_loss_epoch = train_rank_target_loss / denom
         train_acc_epoch = 100.0 * train_correct / denom
 
         train_mean_rank_normalized_epoch = train_mean_rank_normalized / denom
@@ -601,7 +641,6 @@ def fit_dynamic_model(
                         "loss": train_loss_epoch,
                         "ce_loss": train_ce_loss_epoch,
                         "rank_loss": train_rank_loss_epoch,
-                        "rank_target_loss": train_rank_target_loss_epoch,
                         "acc": train_acc_epoch,
                         "mean_rank_normalized": train_mean_rank_normalized_epoch,
                         "rank_variance": train_rank_variance_epoch,
@@ -618,7 +657,6 @@ def fit_dynamic_model(
                     "target_rank_normalized": getattr(criterion, "target_rank_normalized", None),
                     "rank_loss_mode": getattr(criterion, "rank_loss_mode", None),
                     "rank_var_weight": getattr(criterion, "rank_var_weight", None),
-                    "rank_target_loss_weight": getattr(criterion, "rank_target_loss_weight", None),
                 },
                 model_path,
             )
@@ -628,7 +666,6 @@ def fit_dynamic_model(
             "train_loss": train_loss_epoch,
             "train_ce_loss": train_ce_loss_epoch,
             "train_rank_loss": train_rank_loss_epoch,
-            "train_rank_target_loss": train_rank_target_loss_epoch,
             "train_acc": train_acc_epoch,
             "train_mean_rank_normalized": train_mean_rank_normalized_epoch,
             "train_rank_variance": train_rank_variance_epoch,
@@ -647,10 +684,13 @@ def fit_dynamic_model(
             "rank_target_loss_weight": getattr(criterion, "rank_target_loss_weight", None),
         }
         history["epochs_log"].append(epoch_log)
+        
+        # Get current learning rate
+        current_lr = optimizer.param_groups[0]['lr']
+        
         print(f"\nEpoch {epoch+1}/{epochs} Summary:")
+        print(f"  Learning Rate: {current_lr:.2e}")
         print(f"  Train Loss: {train_loss_epoch:.4f}   CE Loss: {train_ce_loss_epoch:.4f}   Rank Loss: {train_rank_loss_epoch:.4f}")
-        if k_rank_samples > 0:
-            print(f"  Rank Target Loss: {train_rank_target_loss_epoch:.4f} (k={k_rank_samples}, weight={getattr(criterion, 'rank_target_loss_weight', 0.0)})")
         print(f"  Train Acc: {train_acc_epoch:.2f}%")
         print(f"  Expected Rank: {train_expected_rank_epoch:.2f} / {max_rank}   Rank Variance: {train_rank_variance_epoch:.6f}")
         if val_loader is not None:

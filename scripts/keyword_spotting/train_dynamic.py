@@ -15,7 +15,8 @@ from thesis_project.training.key_word_spotting import CrossEntropyPlusRankLoss, 
 # Training configuration
 batch_size = 64
 num_epochs = 60
-init_learning_rate = 1e-5
+init_learning_rate = 1e-6
+min_learning_rate = 1e-7
 
 maximum_useful_rank = 64
 target_rank = 16
@@ -83,19 +84,18 @@ train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, pin_me
 criterion = CrossEntropyPlusRankLoss(
     target_rank_normalized=target_rank_normalized,
     rank_loss_weight=5.0,
-    rank_loss_mode="per_sample_mse",
-    rank_var_weight=0.0,
+    rank_loss_mode="asymmetric_mse",
+    asymmetric_alpha=2.0,
+    rank_var_weight=0,
 )
 optimizer = torch.optim.Adam(model.parameters(), lr=init_learning_rate)
 
-#TODO: potentially play around with scheduler later
-# scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-#     optimizer,
-#     mode="min",      # we want to minimize val loss
-#     factor=0.5,      # reduce LR by a factor of 0.5
-#     patience=3,      # epochs with no improvement before reducing LR
-# )
-scheduler = None
+# Cosine annealing LR scheduler
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    optimizer,
+    T_max=num_epochs,  # number of epochs for one cosine cycle
+    eta_min=min_learning_rate,      # minimum learning rate
+)
 
 model, history = fit_dynamic_model(
     model=model,
@@ -107,5 +107,5 @@ model, history = fit_dynamic_model(
     scheduler=scheduler,
     run_dir=None, # automatically create timestamped folder, but can be set customly
     max_rank=maximum_useful_rank,
-    k_rank_samples=20,
+    enable_rank_supervision=True,
 )
