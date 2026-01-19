@@ -57,8 +57,8 @@ class CrossEntropyPlusRankLoss(nn.Module):
     def __init__(
         self,
         *,
-        target_rank_normalized: float,
-        rank_loss_weight: float,
+        target_rank_normalized: Optional[float] = None,
+        rank_loss_weight: Optional[float] = 1.0,
         rank_loss_mode: Literal["batch_mean_mse", "per_sample_mse","avg_rank","riccardo_special","asymmetric_mse"] = "batch_mean_mse",
         rank_var_weight: float = 0.0,
         class_weight: Optional[torch.Tensor] = None,
@@ -105,8 +105,8 @@ class CrossEntropyPlusRankLoss(nn.Module):
         """
         super().__init__()
 
-        self.target_rank_normalized = float(target_rank_normalized)
-        self.rank_loss_weight = float(rank_loss_weight)
+        self.target_rank_normalized = float(target_rank_normalized) if target_rank_normalized is not None else None
+        self.rank_loss_weight = float(rank_loss_weight) if rank_loss_weight is not None else None
         self.rank_loss_mode = rank_loss_mode
         self.rank_var_weight = float(rank_var_weight)
         self.asymmetric_alpha = float(asymmetric_alpha)
