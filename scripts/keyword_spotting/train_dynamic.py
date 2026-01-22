@@ -14,7 +14,7 @@ from thesis_project.training.key_word_spotting import CrossEntropyPlusRankLoss, 
 #TODO: Should not be hardcoded here
 # Training configuration
 batch_size = 64
-num_epochs = 60
+num_epochs = 10
 init_learning_rate = 1e-4
 min_learning_rate = 0.5e-4
 
@@ -72,13 +72,13 @@ data_dir = get_data_dir()
 train_set = SpeechCommandsGoogle(root=str(data_dir), subset="training", download=True, **noise_train_cfg.model_dump())
 
 # only usee 1000 random samples for quick testing
-indices = np.random.choice(len(train_set), size=1000, replace=False)
-train_set = torch.utils.data.Subset(train_set, indices) #type: ignore
+#indices = np.random.choice(len(train_set), size=1000, replace=False)
+#train_set = torch.utils.data.Subset(train_set, indices) #type: ignore
 
 train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, pin_memory = pin_memory, num_workers=num_workers)
 
-#val_set = SpeechCommandsGoogle(root=str(data_dir), subset="validation", download=True, **noise_eval_cfg.model_dump())
-#val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, pin_memory = pin_memory, num_workers=num_workers)
+val_set = SpeechCommandsGoogle(root=str(data_dir), subset="validation", download=True, **noise_eval_cfg.model_dump())
+val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, pin_memory = pin_memory, num_workers=num_workers)
 
 # Loss function and optimizer
 criterion = CrossEntropyPlusRankLoss(
