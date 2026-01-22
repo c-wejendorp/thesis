@@ -15,11 +15,11 @@ from thesis_project.training.key_word_spotting import CrossEntropyPlusRankLoss, 
 # Training configuration
 batch_size = 64
 num_epochs = 60
-init_learning_rate = 1e-6
-min_learning_rate = 1e-7
+init_learning_rate = 1e-4
+min_learning_rate = 0.5e-4
 
 maximum_useful_rank = 64
-target_rank = 16
+target_rank = 1
 target_rank_normalized = (target_rank - 1) / (maximum_useful_rank - 1) # normalize to [0, 1] range
 
 torch.manual_seed(42)
@@ -48,8 +48,8 @@ base_model = KWSBase(cfg).to(device)
 base_model.load_state_dict(torch.load("model_runs/base/2025-12-14_18-48-50/best_model.pth"))
 router = GRURouter(
     input_dim=base_model.spectrogram_bins, #type: ignore
-    fc_hidden_dim=128,
-    gru_hidden_dim=64,
+    fc_hidden_dim=32,
+    gru_hidden_dim=16,
     num_gru_layers=1,
     max_rank=maximum_useful_rank,
     last_layer_bias_init= None # to bias towards full rank at start
@@ -83,10 +83,11 @@ train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, pin_me
 # Loss function and optimizer
 criterion = CrossEntropyPlusRankLoss(
     target_rank_normalized=target_rank_normalized,
-    rank_loss_weight=5.0,
-    rank_loss_mode="asymmetric_mse",
-    asymmetric_alpha=2.0,
+    rank_loss_weight=2.0,
+    rank_loss_mode="ce_gated",
+    asymmetric_alpha=0.0,
     rank_var_weight=0,
+    ce_gate_threshold=0.1,
 )
 optimizer = torch.optim.Adam(model.parameters(), lr=init_learning_rate)
 
@@ -100,6 +101,7 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
 model, history = fit_dynamic_model(
     model=model,
     train_loader=train_loader,
+    #val_loader=val_loader,
     optimizer=optimizer,
     criterion=criterion,
     device=device,
@@ -107,5 +109,7 @@ model, history = fit_dynamic_model(
     scheduler=scheduler,
     run_dir=None, # automatically create timestamped folder, but can be set customly
     max_rank=maximum_useful_rank,
-    enable_rank_supervision=True,
+    enable_rank_supervision=False,
+    #val_snr_values=[-5, 0, 5, 10,15,float('inf')]
+
 )
