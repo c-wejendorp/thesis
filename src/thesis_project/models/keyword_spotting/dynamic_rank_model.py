@@ -3,6 +3,7 @@ import torch.nn as nn
 from .base_model import KWSBase
 from thesis_project.models.components.routers import GRURouter
 from typing import Sequence, Optional
+from thesis_project.models.components.layers import LowRankPointwiseConv1d
 
 class KWSDynamic(nn.Module):
     #TODO, make base class for the router models
@@ -34,7 +35,19 @@ class KWSDynamic(nn.Module):
                 p.requires_grad_(False)
             self.base.eval()
         else:
-            raise NotImplementedError("Unfreezing base model not implemented yet.")
+            # raise not implemented 
+            raise NotImplemented
+            for p in self.base.parameters():
+                p.requires_grad_(False)
+            for module in self.base.modules():
+               if isinstance(module, LowRankPointwiseConv1d):
+               # set grad true for S parameter.
+                if module.S is not None:
+                    module.S.requires_grad_(True)
+
+            #pass
+        
+            #raise NotImplementedError("Unfreezing base model not implemented yet.")
 
         return toggle_log
 
