@@ -59,7 +59,7 @@ class CrossEntropyPlusRankLoss(nn.Module):
         *,
         target_rank_normalized: Optional[float] = None,
         rank_loss_weight: Optional[float] = 1.0,
-        rank_loss_mode: Literal["batch_mean_mse", "per_sample_mse","avg_rank","riccardo_special","asymmetric_mse","ce_gated"] = "batch_mean_mse",
+        rank_loss_mode: Literal["batch_mean_mse", "per_sample_mse","avg_rank","riccardo_special","asymmetric_mse","ce_gated","one_sided_mse"] = "batch_mean_mse",
         rank_var_weight: float = 0.0,
         class_weight: Optional[torch.Tensor] = None,
         asymmetric_alpha: float = 2.0,
@@ -92,6 +92,12 @@ class CrossEntropyPlusRankLoss(nn.Module):
                     alpha * error^2 if error > 0, else error^2
                     This encourages the distribution tail towards lower ranks.
                     Works with both scalar and per-sample tensor targets.
+
+                - "one_sided_mse":
+                    Only penalizes ranks above target (no penalty below).
+                    error^2 if error > 0, else 0
+                    This allows the model to use lower ranks freely while
+                    preventing it from exceeding the target.
 
                 - "ce_gated":
                     CE-gated compute penalty. Apply rank penalty only when
@@ -231,6 +237,12 @@ class CrossEntropyPlusRankLoss(nn.Module):
                 error.pow(2),                          # normal penalty for undershooting
             ).mean()
 
+        elif self.rank_loss_mode == "one_sided_mse":
+            # Only penalize when rank exceeds target (no penalty for undershooting)
+            # This allows using lower ranks freely while preventing waste
+            error = r_normalized - target
+            rank_loss = F.relu(error).pow(2).mean()
+
         elif self.rank_loss_mode == "ce_gated":
             # CE-gated compute penalty: apply rank pressure only when CE is "okay"
             # Gate function: g(CE) = sigmoid((threshold - CE) * smoothness)
@@ -317,9 +329,13 @@ def validate_dynamic_model(
                 labels = labels.to(device)
 
                 # ---- Forward ----
-                classif_logits, router_output, classif_logits_full_rank = model(waveforms)
+                
+                classif_logits, router_output_dict, classif_logits_full_rank = model(waveforms)
                 #classif_logits, router_output = model(waveforms)
-                r_normalized = router_output["ranks_normalized"]  # (B,) or (B,1)
+                #r_normalized = router_output["ranks_normalized"]  # (B,) or (B,1)
+                r_normalized = router_output_dict["per_stack"][0]["ranks_normalized"]
+
+                r_cont_ceiled = torch.ceil(router_output_dict["per_stack"][0]["ranks_cont"])  # continuous rank, ceiled
 
                 # ---- Loss ----
                 try:
@@ -506,10 +522,10 @@ def fit_dynamic_model(
 
             optimizer.zero_grad()
 
-            classif_logits, router_output, classif_logits_full_rank = model(waveforms)
+            classif_logits, router_output_dict, classif_logits_full_rank = model(waveforms)
 
-            r_normalized = router_output["ranks_normalized"]
-            r_cont_ceiled = torch.ceil(router_output["ranks_cont"])  # continuous rank, ceiled
+            r_normalized = router_output_dict["per_stack"][0]["ranks_normalized"]
+            r_cont_ceiled = torch.ceil(router_output_dict["per_stack"][0]["ranks_cont"])  # continuous rank, ceiled
 
             # --- Compute rank target (if enabled) ---
             # When enable_rank_supervision=True, we test ALL ranks from 1 up to
