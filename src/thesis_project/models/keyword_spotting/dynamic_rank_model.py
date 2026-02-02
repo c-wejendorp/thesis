@@ -13,29 +13,43 @@ class KWSDynamic(nn.Module):
     def __init__(
         self,
         base: KWSBase,
-        routers: nn.ModuleList,          # len 1 for global; len n_stacks for per-stack
+        router: nn.Module,          # Single router placed after frontend
         *,
-        use_global_router: bool = True,
+        use_global_rank: bool = True,
         low_rank_frontend: bool = False,
         freeze_base: bool = True,
     ) -> None:
         super().__init__()
         self.base = base
-        self.routers = routers
-        self.use_global_router = use_global_router
+        self.router = router
+        self.use_global_rank = use_global_rank
         self.freeze_base = freeze_base
+        
+        # Check that router's num_rank_outputs doesn't exceed num_stacks
+        n_stacks = len(self.base.backbone)
+        
+        # Router must have num_rank_outputs attribute
+        if not hasattr(router, 'num_rank_outputs'):
+            raise ValueError(
+                f"Router must have 'num_rank_outputs' attribute. "
+                f"Got router of type {type(router).__name__}."
+            )
+        
+        if router.num_rank_outputs > n_stacks:
+            raise ValueError(
+                f"Router num_rank_outputs ({router.num_rank_outputs}) cannot exceed "
+                f"number of stacks ({n_stacks})."
+            )
+        
+        # If using global rank, router must output exactly 1 rank
+        if use_global_rank and router.num_rank_outputs != 1:
+            raise ValueError(
+                f"When use_global_rank=True, router must have num_rank_outputs=1, "
+                f"got {router.num_rank_outputs}."
+            )
 
         # build low-rank params + optionally freeze base
         self.toggle_low_rank(low_rank_frontend=low_rank_frontend)
-
-        # sanity checks
-        if use_global_router:
-            if len(self.routers) < 1:
-                raise ValueError("Global router mode requires routers to have length >= 1.")
-        else:
-            n_stacks = len(self.base.backbone)
-            if len(self.routers) != n_stacks:
-                raise ValueError(f"Per-stack router mode requires len(routers)==n_stacks ({n_stacks}), got {len(self.routers)}")
 
     def toggle_low_rank(
         self,
@@ -69,62 +83,54 @@ class KWSDynamic(nn.Module):
 
         # --- Frontend ---
         low_rank_frontend = getattr(self.base, "_frontend_low_rank_enabled")
-        x_feat = self.base.frontend(x_spec, ranks=None if not low_rank_frontend else None)  # (B,C,T)
+        x = self.base.frontend(x_spec, ranks=None if not low_rank_frontend else None)  # (B,C,T)
 
         low_rank_stacks = getattr(self.base, "_stacks_low_rank_enabled")
-        n_stacks = len(self.base.backbone)
 
-        # ---------- ROUTER(S) ----------
-        global_out: Optional[dict] = None
-        global_ranks: Optional[torch.Tensor] = None
-
-        if self.use_global_router:
-            # compute ONCE before stack 0, reuse everywhere
-            global_out = self.routers[0](self._router_input_from_feat(x_feat))
-            global_ranks = global_out["ranks_cont"]          # (B,)
-            # (optional) ensure shape
-            if global_ranks.dim() != 1:
-                global_ranks = global_ranks.view(-1)
-
-        per_stack_out: list[dict] = []
+        # ---------- ROUTER ----------
+        # Single router placed after frontend, outputs 1 to n_stacks ranks
+        router_out = self.router(self._router_input_from_feat(x))
+        ranks_cont = router_out["ranks_cont"]  # (B, num_rank_outputs)
+        
+        # Ensure 2D shape: (B, num_rank_outputs)
+        if ranks_cont.dim() == 1:
+            ranks_cont = ranks_cont.unsqueeze(-1)  # (B, 1)
+        
+        num_rank_outputs = ranks_cont.shape[1]
 
         # ---------- BACKBONE ----------
         for s_idx, stack in enumerate(self.base.backbone):
-            # choose ranks for this stack
-            if self.use_global_router:
-                router_out = global_out
-                ranks_to_stack = global_ranks
+            # Determine ranks for this stack
+            if self.use_global_rank:
+                # Global rank used across all stacks (enforced: num_rank_outputs == 1)
+                ranks_to_stack = ranks_cont[:, 0]  # (B,)
+            elif s_idx < num_rank_outputs:
+                # Use the corresponding rank for this stack
+                ranks_to_stack = ranks_cont[:, s_idx]  # (B,)
             else:
-                router_out = self.routers[s_idx](self._router_input_from_feat(x_feat))
-                ranks_to_stack = router_out["ranks_cont"]
-                if ranks_to_stack.dim() != 1:
-                    ranks_to_stack = ranks_to_stack.view(-1)
-
-            per_stack_out.append(router_out if router_out is not None else {})
-
+                # No rank available for this stack, use full rank
+                ranks_to_stack = None
+            
+            # Override with None if stack doesn't have low-rank enabled
             if not low_rank_stacks[s_idx]:
+                raise ValueError(f"Stack {s_idx} does not have low-rank enabled but was given ranks.")
                 ranks_to_stack = None
 
-            x_pre_stack = x_feat
+            x_pre_stack = x
             for block in stack:
                 if self.base.backbone_residual_in_blocks:
-                    x_feat = block(x_feat, ranks=ranks_to_stack) + x_feat
+                    x = block(x, ranks=ranks_to_stack) + x
                 else:
-                    x_feat = block(x_feat, ranks=ranks_to_stack)
+                    x = block(x, ranks=ranks_to_stack)
 
             if self.base.backbone_residual_in_stacks:
-                x_feat = x_feat + x_pre_stack
+                x = x + x_pre_stack
 
         # --- Classifier ---
-        logits = self.base.classifier(x_feat.mean(dim=-1))
+        logits = self.base.classifier(x.mean(dim=-1))
 
         # --- Full rank baseline (optional) ---
         with torch.no_grad():
-            logits_full = self.base.forward(x_spec, ranks=None, x_is_spec=True)
+            logits_full_rank = self.base.forward(x_spec, ranks=None, x_is_spec=True)
 
-        router_info = {
-            "global": global_out,
-            "per_stack": per_stack_out,
-            "mode": "global" if self.use_global_router else "per_stack",
-        }
-        return logits, router_info, logits_full
+        return logits, router_out, logits_full_rank

@@ -28,11 +28,12 @@ val_snr_values = [-5, 0, 5, 10, 15, float('inf')]
 
 # PHASE 1: Coarse grid search
 # Hyperparameter grid - sparse sampling for initial exploration
-target_ranks = [20, 24, 27]  # Representative sample
-#rank_loss_weights = [1.0, 5.0, 9.0]  # Low, medium, high
-rank_loss_weights = [5.0, 7.0, 9.0, 11.0, 13.0]  # Low, medium, high
+target_ranks = [20,24,27]  # Representative sample
+#rank_loss_weights = [9.0, 13.0, 17.0]  # Low, medium, high
+rank_loss_weights = [1.0,5.0]  # Low, medium, high
+#rank_loss_weights = [11.0]  # Low, medium, high
 #rank_loss_modes = ["avg_rank", "batch_mean_mse", "per_sample_mse", "one_sided_mse"]  # All modes
-rank_loss_modes = ["one_sided_mse"]  # All modes
+rank_loss_modes = ["ce_gated"]
 
 #pool_modes = [None, "avg"]  # No pooling and average pooling
 pool_modes = ["avg"]  # No pooling and average pooling
@@ -67,8 +68,8 @@ train_set = SpeechCommandsGoogle(root=str(data_dir), subset="training", download
 
 train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, pin_memory=pin_memory, num_workers=num_workers)
 
-val_set = SpeechCommandsGoogle(root=str(data_dir), subset="validation", download=True, **noise_eval_cfg.model_dump())
-val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, pin_memory=pin_memory, num_workers=num_workers)
+#val_set = SpeechCommandsGoogle(root=str(data_dir), subset="validation", download=True, **noise_eval_cfg.model_dump())
+#val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, pin_memory=pin_memory, num_workers=num_workers)
 
 # Load base model once
 base_model_state = torch.load("model_runs/base/2025-12-14_18-48-50/best_model.pth")
@@ -105,6 +106,7 @@ for idx, (target_rank, rank_loss_weight, rank_loss_mode, pool_mode, pool_kernel_
         gru_hidden_dim=48,
         num_gru_layers=1,
         max_rank=maximum_useful_rank,
+        num_rank_outputs=3,
         last_layer_bias_init=None,
         pool_type=pool_mode,
         pool_kernel_size=pool_kernel_size
