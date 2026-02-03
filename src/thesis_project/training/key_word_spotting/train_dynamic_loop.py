@@ -5,6 +5,7 @@ from typing import Literal, Optional, Any, Dict, Tuple, List
 from thesis_project.training.key_word_spotting.loss_functions import DynamicRoutingLoss
 from thesis_project.utils.paths import create_run_folder
 import numpy as np
+import json
 import os
 from tqdm import tqdm
 
@@ -33,7 +34,7 @@ def fit_dynamic_model(
         run_dir = create_run_folder("model_runs/dynamic")
 
     model_path = os.path.join(run_dir, "best_model.pth")
-    epoch_log_path = os.path.join(run_dir, "history.npy")
+    epoch_log_path = os.path.join(run_dir, "history.json")
 
     model.to(device)
 
@@ -51,6 +52,7 @@ def fit_dynamic_model(
         train_rank_loss_weighted = 0.0
         train_mean_rank_normalized = 0.0
         train_rank_variance = 0.0
+        train_mean_r_stacks = None  # Will be initialized on first batch
 
         train_correct = 0
         train_total = 0
@@ -105,6 +107,20 @@ def fit_dynamic_model(
             train_rank_loss_weighted += float(loss_out.rank_loss_weighted) * batch_size
             train_mean_rank_normalized += float(loss_out.batch_mean_rank_normalized) * batch_size
             train_rank_variance += float(loss_out.rank_variance) * batch_size
+            
+            # Average r_cont_ceiled across batch dimension, keeping stack dimension
+            r_stacks_batch_mean = r_cont_ceiled.detach().mean(dim=0).cpu().numpy()  # (num_stacks,) or scalar
+            
+            # Expand to match backbone length if using global rank
+            num_stacks = len(model.base.backbone) # type: ignore
+            if r_stacks_batch_mean.size != num_stacks:
+                # Global rank case: expand single value to all stacks
+                r_stacks_batch_mean = np.full(num_stacks, r_stacks_batch_mean.item())
+            
+            if train_mean_r_stacks is None:
+                train_mean_r_stacks = r_stacks_batch_mean * batch_size
+            else:
+                train_mean_r_stacks += r_stacks_batch_mean * batch_size
 
             preds = classif_logits.argmax(dim=1)
             train_correct += (preds == labels).sum().item()
@@ -112,12 +128,15 @@ def fit_dynamic_model(
             # For tqdm: show running expected rank (mean_rnorm * (max_rank - 1) + 1)
             running_mean_rnorm = train_mean_rank_normalized / max(train_total, 1)
             running_expected_rank = running_mean_rnorm * (max_rank - 1) + 1
+            running_mean_r_stacks_all = (train_mean_r_stacks / max(train_total, 1)).tolist()
+            r_stacks_str = '[' + ','.join([f"{r:.1f}" for r in running_mean_r_stacks_all]) + ']'
 
             pbar.set_postfix({
                 "loss": f"{loss_out.loss.item():.4f}",
                 "ce": f"{float(loss_out.ce_loss):.4f}",
-                "rank_loss_weighted": f"{float(loss_out.rank_loss_weighted):.4f}",
+                "rl_w": f"{float(loss_out.rank_loss_weighted):.4f}",
                 "exp_r": f"{running_expected_rank:.1f}",
+                "r_stacks": r_stacks_str,
                 "acc": f"{100 * train_correct / train_total:.2f}%"
             })
 
@@ -139,6 +158,12 @@ def fit_dynamic_model(
         train_mean_rank_normalized_epoch = train_mean_rank_normalized / denom
         train_rank_variance_epoch = train_rank_variance / denom
         train_expected_rank_epoch = train_mean_rank_normalized_epoch * (max_rank - 1) + 1
+        
+        # Per-stack mean ceiled ranks
+        if train_mean_r_stacks is not None:
+            train_mean_r_stacks_epoch = (train_mean_r_stacks / denom).tolist()
+        else:
+            train_mean_r_stacks_epoch = []
 
         # ===============================
         # --------- VALIDATION ----------
@@ -173,6 +198,7 @@ def fit_dynamic_model(
                 "mean_rank_normalized": train_mean_rank_normalized_epoch,
                 "rank_variance": train_rank_variance_epoch,
                 "expected_rank": train_expected_rank_epoch,
+                "mean_r_stacks": train_mean_r_stacks_epoch,
             },
             "val_metrics": {
                 "loss": val_loss_epoch,
@@ -212,6 +238,7 @@ def fit_dynamic_model(
             "train_mean_rank_normalized": train_mean_rank_normalized_epoch,
             "train_rank_variance": train_rank_variance_epoch,
             "train_expected_rank": train_expected_rank_epoch,
+            "train_mean_r_stacks": train_mean_r_stacks_epoch,
             "best_train_loss": best_train_loss,
             # Validation metrics
             "val_loss": val_loss_epoch,
@@ -235,14 +262,16 @@ def fit_dynamic_model(
         print(f"  Learning Rate: {current_lr:.2e}")
         print(f"  Train Loss: {train_loss_epoch:.4f}   CE Loss: {train_ce_loss_epoch:.4f}   Weigthed Rank Loss: {train_rank_loss_weighted_epoch:.4f}")
         print(f"  Train Acc: {train_acc_epoch:.2f}%")
-        print(f"  Expected Rank: {train_expected_rank_epoch:.2f} / {max_rank} Rank Variance: {train_rank_variance_epoch:.6f}")
+        r_stacks_str = ', '.join([f"{r:.2f}" for r in train_mean_r_stacks_epoch])
+        print(f"  Expected Rank: {train_expected_rank_epoch:.2f} / {max_rank}   Avg R Stacks: [{r_stacks_str}]   Rank Variance: {train_rank_variance_epoch:.6f}")
         if val_loader is not None:
             print(f"  Val Loss: {val_loss_epoch:.4f}   Val Acc: {val_acc_epoch:.2f}%")
             print(f"  Val Expected Rank: {val_expected_rank_epoch:.2f} / {max_rank}")
 
 
         # Save history each epoch (so crashes still leave logs)
-        np.save(epoch_log_path, epoch_logs)
+        with open(epoch_log_path, 'w') as f:
+            json.dump(epoch_logs, f, indent=2)
     return model, epoch_logs
 
 

@@ -40,8 +40,9 @@ NUM_GRU_LAYERS = 1
 USE_GLOBAL_RANK = False
 NUM_RANK_OUTPUTS = 3  # should match the number of stacks in the base model
 assert (USE_GLOBAL_RANK and NUM_RANK_OUTPUTS == 1) or (not USE_GLOBAL_RANK and NUM_RANK_OUTPUTS >= 1)
-assert NUM_RANK_OUTPUTS <= len(base_model.backbone), "NUM_RANK_OUTPUTS cannot exceed number of stacks in base model"
-POOL_MODE = None  # options: None, 'avg', 'max', 'subsample'
+# Have not implemented such that we can get ranks for the first stacks and then full rank for later stacks
+assert NUM_RANK_OUTPUTS == len(base_model.backbone) or USE_GLOBAL_RANK, "NUM_RANK_OUTPUTS must match number of stacks in base model when USE_GLOBAL_RANK is False"
+POOL_MODE = "subsample"  # options: None, 'avg', 'max', 'subsample'
 POOL_REDUCTION_FACTOR = 2 # if pool_mode is 'subsample' this will pick every "kernel_size" element. Ignored if POOL_MODE is None
 
 router = GRURouter(
@@ -50,9 +51,9 @@ router = GRURouter(
     num_gru_layers=NUM_GRU_LAYERS,
     max_rank=maximum_useful_rank,
     num_rank_outputs=NUM_RANK_OUTPUTS,
-    last_layer_bias_init=None,
+    last_layer_bias_init=3.0,
     pool_type=POOL_MODE,
-    pool_reduction_factor=POOL_REDUCTION_FACTOR
+    pool_reduction_factor=POOL_REDUCTION_FACTOR,
 )
 
 # DYNAMIC MODEL CONFIGURATION
@@ -76,10 +77,14 @@ print(f"Trainable params: {n_trainable}")
 PIN_MEMORY = False
 NUM_WORKERS = 0
 BATCH_SIZE = 64
+USE_SUBSET = False  # whether to use a smaller subset of the dataset for quicker testing
+SUBSET_SIZE = 1000  # number of samples in the subset if USE_SUBSET is True
 DO_VALIDATION = False
 VAL_SNR_VALUES = [-5, 0, 5, 10, 15, float('inf')]
 
 train_set = SpeechCommandsGoogle(root=str(get_data_dir()), subset="training", download=True, **noise_train_cfg.model_dump())
+if USE_SUBSET:
+    train_set = torch.utils.data.Subset(train_set, np.random.choice(len(train_set), SUBSET_SIZE, replace=False))
 train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, pin_memory=PIN_MEMORY, num_workers=NUM_WORKERS)
 
 if DO_VALIDATION:
@@ -90,11 +95,11 @@ else:
     VAL_SNR_VALUES = None
 
 # LOSS FUNCTION CONFIGURATION
-RANK_LOSS_WEIGHT = 1.0
-RANK_LOSS_MODE = "one_sided_mse"  # options: look ath the CrossEntropyPlusRankLoss class for available modes
+RANK_LOSS_WEIGHT = 20
+RANK_LOSS_MODE = "per_sample_mse"  # options: look ath the CrossEntropyPlusRankLoss class for available modes
 COMPRESSED_BASE_MODEL_RANK_PR_STACK = [30,30,30] #somewhere near 30 seems to be acceptable from visual inspection
 assert len(COMPRESSED_BASE_MODEL_RANK_PR_STACK) == len(base_model.backbone) # needs to match number of stacks in base model backbone
-TARGET_MAC_FRACTION = 1.0 # target MACs as a fraction of the BASE model MACs with COMPRESSED_BASE_MODEL_RANK_PR_STACK
+TARGET_MAC_FRACTION = 0.5 # target MACs as a fraction of the BASE model MACs with COMPRESSED_BASE_MODEL_RANK_PR_STACK
 
 ENABLE_RANK_SUPERVISION = False
 RANK_SUPERVISION_STABLE = False
@@ -107,23 +112,34 @@ macs_base_model = compute_macs_base_model(
     time_steps=63, 
     rank_pr_stack=COMPRESSED_BASE_MODEL_RANK_PR_STACK
     )
-
 macs_router = router.compute_macs(sequence_length=63)
-macs_target = TARGET_MAC_FRACTION * macs_base_model
-macs_bugdet = int(macs_target - macs_router)
-target_rank_avg = compute_avg_rank_from_macs(
+
+macs_maximum = macs_base_model - macs_router  # max MACs available for ranks to not exceed base model MACs
+ranks_maximum = compute_avg_rank_from_macs(
     base_model, 
     time_steps=63, 
-    macs=macs_bugdet,
+    macs=macs_maximum,
     num_stacks=len(base_model.backbone)
     )
 
-avg_target_rank_normalized = (target_rank_avg - 1) / (maximum_useful_rank - 1)
+macs_target = TARGET_MAC_FRACTION * macs_base_model
+macs_target_budget = int(macs_target - macs_router)
+ranks_target = compute_avg_rank_from_macs(
+    base_model, 
+    time_steps=63, 
+    macs=macs_target_budget,
+    num_stacks=len(base_model.backbone)
+    )
+
+avg_target_rank_normalized = (ranks_target - 1) / (maximum_useful_rank - 1)
 print(f"Base model MACs: {macs_base_model}")
 print(f"Router MACs: {macs_router}")
+print(f"Maximum MACs for ranks: {macs_maximum}")
+print(f"Maximum average rank for ranks: {ranks_maximum:.2f}")
+
 print(f"Target MACs: {macs_target:.2f}")
-print(f"MACs budget for ranks: {macs_bugdet}")
-print(f"Target average rank: {target_rank_avg:.2f}")
+print(f"MACs budget for ranks: {macs_target_budget}")
+print(f"Target average rank: {ranks_target:.2f}")
 
 criterion = create_dynamic_routing_loss(
     rank_loss_mode=RANK_LOSS_MODE,
@@ -133,9 +149,11 @@ criterion = create_dynamic_routing_loss(
 
 
 # TRAINING CONFIGURATION
-NUM_EPOCHS = 5
-INIT_LEARNING_RATE = 1e-4
-MIN_LEARNING_RATE = 0.5e-4
+NUM_EPOCHS = 30 
+#INIT_LEARNING_RATE = 1e-4
+#MIN_LEARNING_RATE = 0.5e-4
+INIT_LEARNING_RATE = 1e-5
+MIN_LEARNING_RATE = 0.5e-5
 
 optimizer = torch.optim.Adam(dynamic_model.parameters(), lr=INIT_LEARNING_RATE) 
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -145,10 +163,10 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
     )
 
 # Create run directory, ideally not in this file but for simplicity kept here
-# run_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-# run_name = f"Some actually descriptive name"
-#run_dir = Path(f"model_runs/dynamic/{run_timestamp}_{run_name}")
-run_dir = Path(f"model_runs/dynamic/temp_run")
+run_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+#run_name = f"Some actually descriptive name"
+run_dir = Path(f"model_runs/dynamic/{run_timestamp}")
+#run_dir = Path(f"model_runs/dynamic/temp_run")
 run_dir.mkdir(parents=True, exist_ok=True)
 print(f"Run directory: {run_dir}")
 
@@ -171,22 +189,13 @@ model, epoch_logs = fit_dynamic_model(
     save_epoch_checkpoints=False,
     )
 
-# print("\nTraining completed!")
-# print(f"Model saved to: {run_dir}")
+print("\nTraining completed!")
+print(f"Model saved to: {run_dir}")
 
-# # Print final metrics
-# epochs_log = history.get("epochs_log", [])
-# if epochs_log:
-#     last_epoch = epochs_log[-1]
-#     print(f"\nFinal metrics:")
-#     print(f"  Train loss: {last_epoch.get('train_loss'):.4f}")
-#     print(f"  Train acc: {last_epoch.get('train_acc'):.2f}%")
-#     print(f"  Expected rank: {last_epoch.get('train_expected_rank'):.1f}")
-
-
-# sample_batch = next(iter(train_loader))
-# sample_inputs = sample_batch[0].to(DEVICE)
-# with torch.no_grad():
-#     base_model.eval()
-#     base_outputs = base_model(sample_inputs)
-#     #MACS_BASE_MODEL = base_model.compute_macs(sample_inputs.shape[-1], rank_pr_stack=[32]*len(base_model.backbone))
+# Print final metrics
+if epoch_logs is not None and len(epoch_logs) > 0:
+    last_epoch = epoch_logs[-1]
+    print(f"\nFinal metrics:")
+    print(f"  Train loss: {last_epoch.get('train_loss'):.4f}")
+    print(f"  Train acc: {last_epoch.get('train_acc'):.2f}%")
+    print(f"  Expected rank: {last_epoch.get('train_expected_rank'):.1f}")
