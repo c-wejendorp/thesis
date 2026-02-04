@@ -28,17 +28,22 @@ def fit_dynamic_model(
     enable_rank_supervision: bool = False,  # if True, find min correct rank and use as target
     rank_supervision_stable: bool = False,  # if True, require prediction to be correct at all higher ranks too
     save_epoch_checkpoints: bool = False,  # if True, save model checkpoint after each epoch
-) -> Tuple[nn.Module, List[Dict[str, Any]]]:
+    log_every_n_steps: Optional[int] = 1,  # if set, log metrics every N steps (1 = every batch/step)
+    scheduler_mode: Literal['epoch', 'step'] = 'step',  # when to step the scheduler
+) -> Tuple[nn.Module, List[Dict[str, Any]], List[Dict[str, Any]]]:
    
     if run_dir is None:
         run_dir = create_run_folder("model_runs/dynamic")
 
     model_path = os.path.join(run_dir, "best_model.pth")
     epoch_log_path = os.path.join(run_dir, "history.json")
+    step_log_path = os.path.join(run_dir, "step_history.json")
 
     model.to(device)
 
     epoch_logs = []
+    step_logs = []
+    global_step = 0
     best_train_loss = float("inf")
     best_val_loss = float("inf")
 
@@ -140,7 +145,34 @@ def fit_dynamic_model(
                 "acc": f"{100 * train_correct / train_total:.2f}%"
             })
 
-        if scheduler is not None:
+            global_step += 1
+
+            # Step-based logging
+            if log_every_n_steps is not None and global_step % log_every_n_steps == 0:
+                step_log = {
+                    "step": global_step,
+                    "epoch": epoch + 1,
+                    "loss": loss_out.loss.item(),
+                    "ce_loss": float(loss_out.ce_loss),
+                    "rank_loss": float(loss_out.rank_loss),
+                    "rank_loss_weighted": float(loss_out.rank_loss_weighted),
+                    "batch_mean_rank_normalized": float(loss_out.batch_mean_rank_normalized),
+                    "rank_variance": float(loss_out.rank_variance),
+                    "batch_acc": 100.0 * (preds == labels).sum().item() / batch_size,
+                    "running_acc": 100.0 * train_correct / train_total,
+                    "running_expected_rank": running_expected_rank,
+                    "lr": optimizer.param_groups[0]['lr'],
+                }
+                step_logs.append(step_log)
+
+            # Step-based scheduler
+            if scheduler is not None and scheduler_mode == 'step':
+                if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    pass  # ReduceLROnPlateau needs validation metric, skip per-step
+                else:
+                    scheduler.step()
+
+        if scheduler is not None and scheduler_mode == 'epoch':
             if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 scheduler.step(train_loss_epoch)  # or val_loss when you add validation
             else:
@@ -272,7 +304,13 @@ def fit_dynamic_model(
         # Save history each epoch (so crashes still leave logs)
         with open(epoch_log_path, 'w') as f:
             json.dump(epoch_logs, f, indent=2)
-    return model, epoch_logs
+        
+        # Save step logs if available
+        if log_every_n_steps is not None and len(step_logs) > 0:
+            with open(step_log_path, 'w') as f:
+                json.dump(step_logs, f, indent=2)
+    
+    return model, epoch_logs, step_logs
 
 
 def rank_supervision_logic(args):

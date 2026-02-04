@@ -96,7 +96,7 @@ else:
 
 # LOSS FUNCTION CONFIGURATION
 RANK_LOSS_WEIGHT = 20
-RANK_LOSS_MODE = "per_sample_mse"  # options: look ath the CrossEntropyPlusRankLoss class for available modes
+RANK_LOSS_MODE = "one_sided_mse"  # options: look ath the CrossEntropyPlusRankLoss class for available modes
 COMPRESSED_BASE_MODEL_RANK_PR_STACK = [30,30,30] #somewhere near 30 seems to be acceptable from visual inspection
 assert len(COMPRESSED_BASE_MODEL_RANK_PR_STACK) == len(base_model.backbone) # needs to match number of stacks in base model backbone
 TARGET_MAC_FRACTION = 0.5 # target MACs as a fraction of the BASE model MACs with COMPRESSED_BASE_MODEL_RANK_PR_STACK
@@ -149,17 +149,32 @@ criterion = create_dynamic_routing_loss(
 
 
 # TRAINING CONFIGURATION
-NUM_EPOCHS = 30 
-#INIT_LEARNING_RATE = 1e-4
-#MIN_LEARNING_RATE = 0.5e-4
-INIT_LEARNING_RATE = 1e-5
-MIN_LEARNING_RATE = 0.5e-5
+NUM_EPOCHS = 5
+INIT_LEARNING_RATE = 1e-4
+MIN_LEARNING_RATE = 0.5e-4
+#INIT_LEARNING_RATE = 1e-5
+#MIN_LEARNING_RATE = 0.5e-5
 
-optimizer = torch.optim.Adam(dynamic_model.parameters(), lr=INIT_LEARNING_RATE) 
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    optimizer,
-    T_max=NUM_EPOCHS,
-    eta_min=MIN_LEARNING_RATE,
+# LOGGING AND SCHEDULER CONFIGURATION
+LOG_EVERY_N_STEPS = 1  # log metrics every N steps (set to None to disable step logging)
+SCHEDULER_MODE = "step"  # options: 'epoch' or 'step' - when to step the learning rate scheduler
+
+optimizer = torch.optim.Adam(dynamic_model.parameters(), lr=INIT_LEARNING_RATE)
+
+# Calculate total steps for step-based scheduler
+if SCHEDULER_MODE == "step":
+    steps_per_epoch = len(train_loader)
+    total_steps = NUM_EPOCHS * steps_per_epoch
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=total_steps,
+        eta_min=MIN_LEARNING_RATE,
+    )
+else:
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=NUM_EPOCHS,
+        eta_min=MIN_LEARNING_RATE,
     )
 
 # Create run directory, ideally not in this file but for simplicity kept here
@@ -171,7 +186,7 @@ run_dir.mkdir(parents=True, exist_ok=True)
 print(f"Run directory: {run_dir}")
 
 # Train model
-model, epoch_logs = fit_dynamic_model(
+model, epoch_logs, step_logs = fit_dynamic_model(
     model=dynamic_model,
     train_loader=train_loader,
     optimizer=optimizer,
@@ -187,6 +202,8 @@ model, epoch_logs = fit_dynamic_model(
     enable_rank_supervision=ENABLE_RANK_SUPERVISION,
     rank_supervision_stable=RANK_SUPERVISION_STABLE,
     save_epoch_checkpoints=False,
+    log_every_n_steps=LOG_EVERY_N_STEPS,
+    scheduler_mode=SCHEDULER_MODE,
     )
 
 print("\nTraining completed!")
@@ -199,3 +216,6 @@ if epoch_logs is not None and len(epoch_logs) > 0:
     print(f"  Train loss: {last_epoch.get('train_loss'):.4f}")
     print(f"  Train acc: {last_epoch.get('train_acc'):.2f}%")
     print(f"  Expected rank: {last_epoch.get('train_expected_rank'):.1f}")
+
+if step_logs is not None and len(step_logs) > 0:
+    print(f"\nStep-level logs saved: {len(step_logs)} steps tracked")
