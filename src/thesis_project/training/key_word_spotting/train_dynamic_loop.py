@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Literal, Optional, Any, Dict, Tuple, List
 from thesis_project.training.key_word_spotting.loss_functions import DynamicRoutingLoss
+from thesis_project.training.key_word_spotting.validate_model import validate_model
 from thesis_project.utils.paths import create_run_folder
 import numpy as np
 import json
@@ -213,7 +214,35 @@ def fit_dynamic_model(
         validate_this_epoch = (epoch + 1) % val_epoch == 0 or is_last_epoch
 
         if val_loader is not None and validate_this_epoch:
-            raise NotImplementedError("validate_dynamic_model function is not implemented.")
+            val_results = validate_model(
+                model=model,
+                val_loader=val_loader,
+                criterion=criterion,
+                device=device,
+                snr_values=val_snr_values,
+                verbose=True,
+                is_dynamic=True,
+                max_rank=max_rank,
+                make_rank_hist=False,
+                return_per_sample=False
+            )
+            
+            # Extract aggregate metrics from validation results
+            if main_val_snr is not None:
+                # Use specific SNR for best model selection
+                snr_key = f"snr_{main_val_snr}" if main_val_snr != float('inf') else "snr_inf"
+                val_loss_epoch = val_results["per_snr_results"][snr_key]["loss"]
+                val_acc_epoch = val_results["per_snr_results"][snr_key]["acc"]
+                val_mean_rank_normalized_epoch = val_results["per_snr_results"][snr_key]["mean_rank_normalized"]
+                val_expected_rank_epoch = val_results["per_snr_results"][snr_key]["expected_rank"]
+                val_rank_loss_weighted_epoch = val_results["per_snr_results"][snr_key]["rank_loss_weighted"]
+            else:
+                # Use mean across all SNRs
+                val_loss_epoch = val_results["loss"]
+                val_acc_epoch = val_results["acc"]
+                val_mean_rank_normalized_epoch = val_results["mean_rank_normalized"]
+                val_expected_rank_epoch = val_results["expected_rank"]
+                val_rank_loss_weighted_epoch = val_results["rank_loss_weighted"]
         
         # Build checkpoint dictionary once (used for both best model and epoch checkpoints)
         checkpoint = {

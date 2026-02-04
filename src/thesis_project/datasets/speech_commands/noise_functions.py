@@ -35,17 +35,25 @@ def load_random_noise_chunk(
     noise_paths: List[str],
     target_length: int,
     sample_rate: int,
+    rng: random.Random = None,
 ) -> Tuple[Tensor, str]:
     """
-    Your original behavior, now using the helpers.
+    Load a random noise chunk. If rng is provided, selection is deterministic.
     """
-    noise_path = random.choice(noise_paths)
+    if rng is not None:
+        noise_path = rng.choice(noise_paths)
+    else:
+        noise_path = random.choice(noise_paths)
+    
     wav = _load_and_resample(noise_path, sample_rate)
     num_samples = wav.shape[1]
     if num_samples <= target_length:
         return _get_chunk(wav, 0, target_length), Path(noise_path).stem
     
-    start = random.randint(0, num_samples - target_length)
+    if rng is not None:
+        start = rng.randint(0, num_samples - target_length)
+    else:
+        start = random.randint(0, num_samples - target_length)
     return _get_chunk(wav, start, target_length), Path(noise_path).stem
 
 

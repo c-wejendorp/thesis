@@ -37,6 +37,7 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
         upsample: bool = False,
         seed: int = 789,
         seed_deterministic_noise: Optional[int] = None,
+        seed_getitem: Optional[int] = None,
         transform=None,
         add_noise: bool = True,
         noise_prob: float = 0.9,
@@ -58,6 +59,10 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
         self.seed = seed
         self.seed_deterministic_noise = (
             seed if seed_deterministic_noise is None else seed_deterministic_noise)
+        
+        # Deterministic training augmentation
+        self.seed_getitem = seed if seed_getitem is None else seed_getitem
+        self._call_counter = 0  # Global counter for all __getitem__ calls
 
         self.transform = transform if transform is not None else PadOrTrim()
 
@@ -261,6 +266,15 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
 
     def __len__(self) -> int:
         return len(self.samples)
+
+    def _get_rng_for_index(self, index: int) -> random.Random:
+        """
+        Get deterministic RNG and increment global call counter.
+        Each __getitem__ call gets a different but deterministic RNG.
+        """
+        seed = self.seed_getitem + self._call_counter
+        self._call_counter += 1
+        return random.Random(seed)
     
     def __getitem__(self, n: int) -> tuple[Tensor, int, dict]:
         sample_info = self.samples[n]
@@ -270,6 +284,11 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
 
         noise = sample_info.get("noise", None)
         noise_type = sample_info.get("noise_type", None)  # may start as None
+
+        # Get deterministic RNG for training mode
+        rng = None
+        if not self.evaluation:
+            rng = self._get_rng_for_index(n)
 
         # --------- 1) Load base waveform (before transforms) ---------
         if kind == "silence":
@@ -284,8 +303,8 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
                 waveform = noise.clone()
                 utterance = noise_type
             else:
-                # Training: random silence chunk
-                waveform, utterance = self._load_random_noise_chunk(self.silence_paths)
+                # Training: deterministic random silence chunk
+                waveform, utterance = self._load_random_noise_chunk(self.silence_paths, rng=rng)
 
             sample_rate = SAMPLE_RATE
             utterance_number = -1
@@ -339,15 +358,15 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
                 noise_type = ""  # <- string, not None
                 snr_value = float("inf")
             else:
-                snr_value = self._sample_snr_value()
+                snr_value = self._sample_snr_value(rng=rng)
 
                 if kind == "silence":
                     # Silence is just its own noise in training
                     noise = waveform.clone()
                     noise_type = utterance  # filename / descriptor string
                 else:  # keyword or unknown
-                    if random.random() < self.noise_prob:
-                        noise, noise_type = self._load_random_noise_chunk(self.noise_paths)
+                    if rng.random() < self.noise_prob:
+                        noise, noise_type = self._load_random_noise_chunk(self.noise_paths, rng=rng)
                         waveform = add_noise_at_snr(waveform, noise, snr_value)
                     else:
                         # No noise added: zero tensor to keep collate happy
@@ -382,15 +401,18 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
             waveform = self.transform(waveform)
         return waveform
     
-    def _sample_snr_value(self) -> float:
+    def _sample_snr_value(self, rng: Optional[random.Random] = None) -> float:
         if isinstance(self.snr, (int, float)):
             return float(self.snr)
         low, high = self.snr
+        if rng is not None:
+            return float(rng.uniform(low, high))
         return float(torch.empty(1).uniform_(low, high).item())
 
-    def _load_random_noise_chunk(self, noise_paths: list[str]) -> tuple[Tensor, str]:
+    def _load_random_noise_chunk(self, noise_paths: list[str], rng: Optional[random.Random] = None) -> tuple[Tensor, str]:
         return load_random_noise_chunk(
             noise_paths=noise_paths,
             target_length=TARGET_LENGTH,
             sample_rate=SAMPLE_RATE,
+            rng=rng,
         )
