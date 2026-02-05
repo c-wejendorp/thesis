@@ -58,7 +58,7 @@ def validate_model(
     with torch.no_grad():
         for snr in snr_values:
             # Set SNR
-            ds._set_snr(snr)
+            ds.set_snr(snr)
 
             total_loss = 0.0
             total_correct = 0

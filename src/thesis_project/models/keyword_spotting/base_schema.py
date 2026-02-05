@@ -32,7 +32,7 @@ class DatasetConfig(BaseModel):
 class NoiseConfig(BaseModel):
     add_noise: bool
     noise_prob: float
-    snr: float | tuple[float, float]
+    snr: float | tuple[float, float] | None
 
 class KeyWordSpottingBaseConfig(BaseModel):
     spectrogram: SpectrogramConfig

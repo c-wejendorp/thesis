@@ -40,10 +40,10 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
         seed_getitem: Optional[int] = None,
         transform=None,
         add_noise: bool = True,
-        noise_prob: float = 0.9,
+        noise_prob: float = 0.8,
         background_noise_folder: str = NOISE_FOLDER,
         noise_files: list[str] = NOISE_FILES,
-        snr: float | tuple[float, float] = (-5, 15),
+        snr: Optional[float | tuple[float, float]] = None,
         **kwargs,
     ):
         super().__init__(*args, subset=subset, **kwargs)
@@ -79,7 +79,21 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
         self.add_noise = add_noise
         if self.add_noise:
             self.noise_prob = noise_prob
-            self._set_snr(snr)
+            # In evaluation mode, noise_prob must be 1.0 (always add noise when enabled)
+            if self.evaluation and self.noise_prob != 1.0:
+                raise ValueError(
+                    f"In evaluation mode with add_noise=True, noise_prob must be 1.0 (got {noise_prob}). "
+                    "Evaluation requires deterministic behavior: either always add noise (noise_prob=1.0) "
+                    "or disable noise completely (add_noise=False)."
+                )
+            if not self.evaluation:
+                # Training mode: set SNR from parameter (default to range if not provided)
+                if snr is None:
+                    snr = (-5, 15)
+                self.set_snr(snr)
+            else:
+                # Evaluation mode: SNR must be set later via set_snr() before use
+                self.snr = None
         else:
             self.noise_prob = 0.0
             self.snr = float("inf")
@@ -91,13 +105,17 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
     # Initialization helpers
     # ------------------------------------------------------------------
 
-    def _set_snr(self, snr: float | tuple[float, float]) -> None:
-        """Validate and store SNR configuration."""
+    def set_snr(self, snr: float | tuple[float, float]) -> None:
+        """Validate and store SNR configuration.
+        
+        In evaluation mode, this must be called before accessing samples when add_noise=True.
+        """
         assert self.add_noise, "Cannot set SNR if add_noise is False."
 
         # Ranges not allowed in evaluation mode
         if self.evaluation and isinstance(snr, tuple):
-            raise ValueError("In evaluation mode, snr must be a single float (or inf).")
+            raise ValueError("In evaluation mode, snr must be a single float (or inf). " \
+            "In the validation function we use this function over a range of SNRs, but each individual call should have a fixed SNR value.")
 
         # Float case (includes float('inf'))
         if isinstance(snr, (int, float)):
@@ -334,6 +352,14 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
                 snr_value = float("inf")
             else:
                 # Eval WITH deterministic noise:
+                # Check if SNR has been set
+                if self.snr is None:
+                    raise RuntimeError(
+                        "In evaluation mode with add_noise=True, you must set the SNR before accessing samples.\n"
+                        "Call dataset.set_snr(value) where value is a float (e.g., 10.0 for 10dB SNR, or float('inf') for no noise).\n"
+                        "Example: dataset.set_snr(10.0)"
+                    )
+                
                 # attach_deterministic_noise_to_samples should have filled these
                 assert noise is not None, (
                     "In evaluation mode and add_noise=True, all samples should have deterministic noise attached"
@@ -347,6 +373,10 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
                     snr_value = float("inf")
                 else:
                     # Keywords/unknown: inject deterministic noise at fixed eval SNR
+                    # In eval mode, noise_prob is validated to be 1.0, so we always add noise
+                    assert self.noise_prob == 1.0, (
+                        "In evaluation mode with add_noise=True, noise_prob must be 1.0"
+                    )
                     snr_value = self._sample_snr_value()  # fixed float in eval
                     waveform = add_noise_at_snr(waveform, noise, snr_value)
 

@@ -5,25 +5,111 @@ from torch.utils.data import DataLoader
 import numpy as np
 from datetime import datetime
 from pathlib import Path
+import json
 
 from thesis_project.models.keyword_spotting import KWSBase, KWSDynamic
+from thesis_project.models.keyword_spotting.base_schema import (
+    KeyWordSpottingBaseConfig, SpectrogramConfig, BackboneConfig, 
+    NoiseConfig, DatasetConfig
+)
+from thesis_project.models.keyword_spotting.dynamic_schema import (
+    RouterConfig, DynamicModelConfig, DataLoaderConfig, 
+    LossConfig, TrainingConfig, DynamicTrainingConfig
+)
 from thesis_project.models.components.routers import GRURouter
 from thesis_project.utils.paths import get_data_dir
 from thesis_project.utils.compute_macs import compute_macs_base_model, compute_avg_rank_from_macs
 from thesis_project.datasets import SpeechCommandsGoogle
-from base_config_temp import cfg, noise_train_cfg, noise_eval_cfg
+from thesis_project.datasets.speech_commands.config import CANONICAL
 from thesis_project.training.key_word_spotting import fit_dynamic_model, DynamicRoutingLoss, create_dynamic_routing_loss
 
-SEED=42
+# ============================================================================
+# DYNAMIC MODEL CONFIGURATION
+# ============================================================================
+
+# Create configuration using schemas
+router_cfg = RouterConfig(
+    hidden_dim=48,
+    num_gru_layers=1,
+    use_global_rank=True,
+    num_rank_outputs=1,
+    pool_mode="subsample",
+    pool_reduction_factor=2,
+    last_layer_bias_init=3.0,
+)
+
+dynamic_model_cfg = DynamicModelConfig(
+    freeze_base=True,
+    low_rank_frontend=False,
+    base_model_dir="model_runs/base/2025-12-14_18-48-50",
+)
+
+data_loader_cfg = DataLoaderConfig(
+    batch_size=64,
+    use_subset=False,
+    num_workers=0,
+    pin_memory=False,
+    subset_size=1000,
+    do_validation=True,
+    val_snr_values=[-5, 0, 5, 10, 15, float('inf')],
+)
+
+loss_cfg = LossConfig(
+    rank_loss_weight=20,
+    rank_loss_mode="avg_rank",
+    compressed_base_model_rank_pr_stack=[30, 30, 30],
+    target_mac_fraction=0.5,
+    enable_rank_supervision=False,
+    rank_supervision_stable=False,
+)
+
+training_cfg = TrainingConfig(
+    num_epochs=5,
+    init_learning_rate=1e-4,
+    min_learning_rate=0.5e-4,
+    optimizer="Adam",
+    scheduler="CosineAnnealingLR",
+    scheduler_mode="step",
+    log_every_n_steps=1,
+    save_epoch_checkpoints=False,
+)
+
+noise_train_cfg = NoiseConfig(
+    add_noise=True,
+    noise_prob=0.8,
+    snr=(-5, 15)
+)
+
+noise_eval_cfg = NoiseConfig(
+    add_noise=True,
+    noise_prob=1.0,
+    snr=None
+)
+
+# Create complete config
+full_config = DynamicTrainingConfig(
+    seed=42,
+    router=router_cfg,
+    dynamic_model=dynamic_model_cfg,
+    data_loader=data_loader_cfg,
+    loss=loss_cfg,
+    training=training_cfg,
+    noise_train=noise_train_cfg,
+    noise_eval=noise_eval_cfg,
+)
+
+# Load base model config from saved file
+BASE_MODEL_DIR = Path(full_config.dynamic_model.base_model_dir)
+base_model_cfg = KeyWordSpottingBaseConfig(**json.loads((BASE_MODEL_DIR / "base_config.json").read_text()))
+
+# Extract seed for convenience
+SEED = full_config.seed
 
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 random.seed(SEED)
 
-# BASE MODEL CONFIGURATION
-
-BASE_MODEL_PATH = "model_runs/base/2025-12-14_18-48-50/best_model.pth"
-
+# Setup device
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
     torch.cuda.manual_seed(SEED)
@@ -36,45 +122,39 @@ else:
     DEVICE = torch.device("cpu")    
 print(f"Using device: {DEVICE}")
 
-base_model_state = torch.load(BASE_MODEL_PATH)
-base_model = KWSBase(cfg).to(DEVICE)
+# Load base model
+base_model_path = BASE_MODEL_DIR / "best_model.pth"
+base_model_state = torch.load(base_model_path)
+base_model = KWSBase(base_model_cfg).to(DEVICE)
 base_model.load_state_dict(base_model_state)
 base_model_full_rank = min(base_model.cfg.backbone.n_channels_ext, base_model.cfg.backbone.n_channels_int)
 maximum_useful_rank = base_model_full_rank // 2
 
-# ROUTER
-HIDDEN_DIM = 48
-NUM_GRU_LAYERS = 1
-USE_GLOBAL_RANK = True
-NUM_RANK_OUTPUTS = 1  # should match the number of stacks in the base model
-assert (USE_GLOBAL_RANK and NUM_RANK_OUTPUTS == 1) or (not USE_GLOBAL_RANK and NUM_RANK_OUTPUTS >= 1)
-# Have not implemented such that we can get ranks for the first stacks and then full rank for later stacks
-assert NUM_RANK_OUTPUTS == len(base_model.backbone) or USE_GLOBAL_RANK, "NUM_RANK_OUTPUTS must match number of stacks in base model when USE_GLOBAL_RANK is False"
-POOL_MODE = "subsample"  # options: None, 'avg', 'max', 'subsample'
-POOL_REDUCTION_FACTOR = 2 # if pool_mode is 'subsample' this will pick every "kernel_size" element. Ignored if POOL_MODE is None
-LAST_LAYER_BIAS_INIT = 3.0  # positive value to bias towards higher ranks at the start of training
+# Validate router config against base model
+assert (full_config.router.use_global_rank and full_config.router.num_rank_outputs == 1) or \
+       (not full_config.router.use_global_rank and full_config.router.num_rank_outputs >= 1)
+assert full_config.router.num_rank_outputs == len(base_model.backbone) or full_config.router.use_global_rank, \
+       "NUM_RANK_OUTPUTS must match number of stacks in base model when USE_GLOBAL_RANK is False"
 
+# Create router
 router = GRURouter(
     input_dim=base_model.frontend.out_channels,
-    gru_hidden_dim=HIDDEN_DIM,
-    num_gru_layers=NUM_GRU_LAYERS,
+    gru_hidden_dim=full_config.router.hidden_dim,
+    num_gru_layers=full_config.router.num_gru_layers,
     max_rank=maximum_useful_rank,
-    num_rank_outputs=NUM_RANK_OUTPUTS,
-    last_layer_bias_init=LAST_LAYER_BIAS_INIT,
-    pool_type=POOL_MODE,
-    pool_reduction_factor=POOL_REDUCTION_FACTOR,
+    num_rank_outputs=full_config.router.num_rank_outputs,
+    last_layer_bias_init=full_config.router.last_layer_bias_init,
+    pool_type=full_config.router.pool_mode,
+    pool_reduction_factor=full_config.router.pool_reduction_factor,
 )
 
-# DYNAMIC MODEL CONFIGURATION
-FREEZE_BASE = True
-LOW_RANK_FRONTEND = False
-
+# Create dynamic model
 dynamic_model = KWSDynamic(
     base=base_model,
     router=router,
-    use_global_rank=USE_GLOBAL_RANK,
-    low_rank_frontend=LOW_RANK_FRONTEND,
-    freeze_base=FREEZE_BASE
+    use_global_rank=full_config.router.use_global_rank,
+    low_rank_frontend=full_config.dynamic_model.low_rank_frontend,
+    freeze_base=full_config.dynamic_model.freeze_base
 ).to(DEVICE)
 
 n_trainable = sum(p.numel() for p in dynamic_model.parameters() if p.requires_grad)
@@ -82,128 +162,139 @@ total_params = sum(p.numel() for p in dynamic_model.parameters())
 print(f"Total params: {total_params}")
 print(f"Trainable params: {n_trainable}")
 
-# DATASET AND LOADERS CONFIGURATION
-PIN_MEMORY = False
-NUM_WORKERS = 0
-BATCH_SIZE = 64
-USE_SUBSET = True  # whether to use a smaller subset of the dataset for quicker testing
-SUBSET_SIZE = 1000  # number of samples in the subset if USE_SUBSET is True
-DO_VALIDATION = True
-VAL_SNR_VALUES = [-5, 0, 5, 10, 15, float('inf')]
+# Create dataset and loaders
+train_set = SpeechCommandsGoogle(
+    root=str(get_data_dir()), 
+    subset="training", 
+    download=True, 
+    seed=SEED, 
+    **full_config.noise_train.model_dump()
+)
+if full_config.data_loader.use_subset:
+    rng = np.random.default_rng(SEED)
+    train_set = torch.utils.data.Subset(
+        train_set, 
+        rng.choice(len(train_set), full_config.data_loader.subset_size, replace=False)
+    )
 
-train_set = SpeechCommandsGoogle(root=str(get_data_dir()), subset="training", download=True, seed=SEED, **noise_train_cfg.model_dump())
-if USE_SUBSET:
-    rng = np.random.default_rng(SEED)  # Independent generator for subset selection
-    train_set = torch.utils.data.Subset(train_set, rng.choice(len(train_set), SUBSET_SIZE, replace=False))
-train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, pin_memory=PIN_MEMORY, num_workers=NUM_WORKERS,generator=torch.Generator().manual_seed(SEED))
+train_loader = DataLoader(
+    train_set, 
+    batch_size=full_config.data_loader.batch_size, 
+    shuffle=True, 
+    pin_memory=full_config.data_loader.pin_memory, 
+    num_workers=full_config.data_loader.num_workers,
+    generator=torch.Generator().manual_seed(SEED)
+)
 
-if DO_VALIDATION:
-    val_set = SpeechCommandsGoogle(root=str(get_data_dir()), subset="validation", download=True, seed=SEED, **noise_eval_cfg.model_dump())
-    val_loader = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False, pin_memory=PIN_MEMORY, num_workers=NUM_WORKERS)
+if full_config.data_loader.do_validation:
+    val_set = SpeechCommandsGoogle(
+        root=str(get_data_dir()), 
+        subset="validation", 
+        download=True, 
+        seed=SEED, 
+        **full_config.noise_eval.model_dump()
+    )
+    val_loader = DataLoader(
+        val_set, 
+        batch_size=full_config.data_loader.batch_size, 
+        shuffle=False, 
+        pin_memory=full_config.data_loader.pin_memory, 
+        num_workers=full_config.data_loader.num_workers
+    )
 else: 
     val_loader = None
-    VAL_SNR_VALUES = None
 
-# LOSS FUNCTION CONFIGURATION
-RANK_LOSS_WEIGHT = 20
-RANK_LOSS_MODE = "one_sided_mse"  # options: look ath the CrossEntropyPlusRankLoss class for available modes
-COMPRESSED_BASE_MODEL_RANK_PR_STACK = [30,30,30] #somewhere near 30 seems to be acceptable from visual inspection
-assert len(COMPRESSED_BASE_MODEL_RANK_PR_STACK) == len(base_model.backbone) # needs to match number of stacks in base model backbone
-TARGET_MAC_FRACTION = 0.5 # target MACs as a fraction of the BASE model MACs with COMPRESSED_BASE_MODEL_RANK_PR_STACK
+# Validate loss config against base model
+assert len(full_config.loss.compressed_base_model_rank_pr_stack) == len(base_model.backbone), \
+       "compressed_base_model_rank_pr_stack must match number of stacks in base model backbone"
 
-ENABLE_RANK_SUPERVISION = False
-RANK_SUPERVISION_STABLE = False
-# check that RANK_SUPERVISION_STABLE is not used when ENABLE_RANK_SUPERVISION is False
-assert not (RANK_SUPERVISION_STABLE and not ENABLE_RANK_SUPERVISION), "RANK_SUPERVISION_STABLE doesn't make sense when ENABLE_RANK_SUPERVISION is False"
-
-
+# Compute MACs
 macs_base_model = compute_macs_base_model(
     base_model, 
     time_steps=63, 
-    rank_pr_stack=COMPRESSED_BASE_MODEL_RANK_PR_STACK
-    )
+    rank_pr_stack=full_config.loss.compressed_base_model_rank_pr_stack
+)
 macs_router = router.compute_macs(sequence_length=63)
 
-macs_maximum = macs_base_model - macs_router  # max MACs available for ranks to not exceed base model MACs
-ranks_maximum = compute_avg_rank_from_macs(
+breakeven_macs = macs_base_model - macs_router
+breakeven_avg_rank = compute_avg_rank_from_macs(
     base_model, 
     time_steps=63, 
-    macs=macs_maximum,
+    macs=breakeven_macs,
     num_stacks=len(base_model.backbone)
-    )
+)
 
-macs_target = TARGET_MAC_FRACTION * macs_base_model
-macs_target_budget = int(macs_target - macs_router)
-ranks_target = compute_avg_rank_from_macs(
+macs_target_total = full_config.loss.target_mac_fraction * macs_base_model
+macs_low_rank_budget = int(macs_target_total - macs_router)
+target_avg_rank = compute_avg_rank_from_macs(
     base_model, 
     time_steps=63, 
-    macs=macs_target_budget,
+    macs=macs_low_rank_budget,
     num_stacks=len(base_model.backbone)
-    )
+)
 
-avg_target_rank_normalized = (ranks_target - 1) / (maximum_useful_rank - 1)
-print(f"Base model MACs: {macs_base_model}")
-print(f"Router MACs: {macs_router}")
-print(f"Maximum MACs for ranks: {macs_maximum}")
-print(f"Maximum average rank for ranks: {ranks_maximum:.2f}")
+target_avg_rank_normalized = (target_avg_rank - 1) / (maximum_useful_rank - 1)
+print(f"\nMACs Breakdown:")
+print(f"  Base model total: {macs_base_model}")
+print(f"  Router overhead: {macs_router}")
+print(f"  Breakeven MACs (base - router): {breakeven_macs}")
+print(f"  Breakeven average rank: {breakeven_avg_rank:.2f}")
+print(f"\nTarget Configuration (fraction={full_config.loss.target_mac_fraction}):")
+print(f"  Target total (low rank model + router overhead): {macs_target_total:.2f}")
+print(f"  Target budget low rank model: {macs_low_rank_budget}")
+print(f"  Target average rank: {target_avg_rank:.2f}")
+print(f"  Target average rank (normalized): {target_avg_rank_normalized:.3f}")
 
-print(f"Target MACs: {macs_target:.2f}")
-print(f"MACs budget for ranks: {macs_target_budget}")
-print(f"Target average rank: {ranks_target:.2f}")
-
+# Create loss criterion
 criterion = create_dynamic_routing_loss(
-    rank_loss_mode=RANK_LOSS_MODE,
-    rank_loss_weight=RANK_LOSS_WEIGHT,
-    target_rank_normalized= avg_target_rank_normalized
-    )
+    rank_loss_mode=full_config.loss.rank_loss_mode,
+    rank_loss_weight=full_config.loss.rank_loss_weight,
+    target_rank_normalized=target_avg_rank_normalized
+)
 
 
-# TRAINING CONFIGURATION
-NUM_EPOCHS = 3
-INIT_LEARNING_RATE = 1e-4
-MIN_LEARNING_RATE = 0.5e-4
-#INIT_LEARNING_RATE = 1e-5
-#MIN_LEARNING_RATE = 0.5e-5
+# Setup optimizer
+optimizer = torch.optim.Adam(
+    dynamic_model.parameters(), 
+    lr=full_config.training.init_learning_rate
+)
 
-# LOGGING AND SCHEDULER CONFIGURATION
-LOG_EVERY_N_STEPS = 1  # log metrics every N steps (set to None to disable step logging)
-SCHEDULER_MODE = "step"  # options: 'epoch' or 'step' - when to step the learning rate scheduler
-
-optimizer = torch.optim.Adam(dynamic_model.parameters(), lr=INIT_LEARNING_RATE)
-
-# Calculate total steps for step-based scheduler
-if SCHEDULER_MODE == "step":
+# Setup scheduler (optional)
+if full_config.training.scheduler is None:
+    scheduler = None
+    print("No scheduler - using constant learning rate")
+elif full_config.training.scheduler_mode == "step":
     steps_per_epoch = len(train_loader)
-    total_steps = NUM_EPOCHS * steps_per_epoch
+    total_steps = full_config.training.num_epochs * steps_per_epoch
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=total_steps,
-        eta_min=MIN_LEARNING_RATE,
+        eta_min=full_config.training.min_learning_rate,
     )
 else:
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        T_max=NUM_EPOCHS,
-        eta_min=MIN_LEARNING_RATE,
+        T_max=full_config.training.num_epochs,
+        eta_min=full_config.training.min_learning_rate,
     )
 
-# Create run directory, ideally not in this file but for simplicity kept here
+# Create run directory
 run_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-#run_name = f"Some actually descriptive name"
 run_dir = Path(f"model_runs/dynamic/{run_timestamp}")
-#run_dir = Path(f"model_runs/dynamic/temp_run")
 run_dir.mkdir(parents=True, exist_ok=True)
 print(f"Run directory: {run_dir}")
 
-# Save configuration for reproducibility
-config_dict = {
-    "seed": SEED,
-    "device": str(DEVICE),
+# Save configuration schema directly
+config_path = run_dir / "config.json"
+with open(config_path, 'w') as f:
+    json.dump(full_config.model_dump(), f, indent=2)
+print(f"Configuration saved to: {config_path}")
+
+# Save runtime information separately
+runtime_info = {
     "timestamp": run_timestamp,
-    
-    # Base model configuration
-    "base_model": {
-        "path": BASE_MODEL_PATH,
+    "device": str(DEVICE),
+    "base_model_info": {
         "full_rank": base_model_full_rank,
         "maximum_useful_rank": maximum_useful_rank,
         "n_stacks": len(base_model.backbone),
@@ -212,77 +303,26 @@ config_dict = {
         "kernel_size": base_model.cfg.backbone.kernel_size,
         "n_blocks_pr_stack": base_model.cfg.backbone.n_blocks_pr_stack,
     },
-    
-    # Router configuration
-    "router": {
-        "type": "GRURouter",
-        "hidden_dim": HIDDEN_DIM,
-        "num_gru_layers": NUM_GRU_LAYERS,
-        "use_global_rank": USE_GLOBAL_RANK,
-        "num_rank_outputs": NUM_RANK_OUTPUTS,
-        "pool_mode": POOL_MODE,
-        "pool_reduction_factor": POOL_REDUCTION_FACTOR,
-        "last_layer_bias_init": 3.0,
-    },
-    
-    # Dynamic model configuration
-    "dynamic_model": {
-        "freeze_base": FREEZE_BASE,
-        "low_rank_frontend": LOW_RANK_FRONTEND,
+    "model_params": {
         "total_params": total_params,
         "trainable_params": n_trainable,
     },
-    
-    # Dataset configuration
-    "dataset": {
-        "batch_size": BATCH_SIZE,
-        "pin_memory": PIN_MEMORY,
-        "num_workers": NUM_WORKERS,
-        "use_subset": USE_SUBSET,
-        "subset_size": SUBSET_SIZE if USE_SUBSET else None,
-        "do_validation": DO_VALIDATION,
-        "val_snr_values": VAL_SNR_VALUES,
-    },
-    
-    # Loss configuration
-    "loss": {
-        "rank_loss_weight": RANK_LOSS_WEIGHT,
-        "rank_loss_mode": RANK_LOSS_MODE,
-        "compressed_base_model_rank_pr_stack": COMPRESSED_BASE_MODEL_RANK_PR_STACK,
-        "target_mac_fraction": TARGET_MAC_FRACTION,
-        "enable_rank_supervision": ENABLE_RANK_SUPERVISION,
-        "rank_supervision_stable": RANK_SUPERVISION_STABLE,
-    },
-    
-    # MAC computation
     "macs": {
         "base_model": float(macs_base_model),
         "router": float(macs_router),
-        "maximum_for_ranks": float(macs_maximum),
-        "target": float(macs_target),
-        "target_budget_for_ranks": float(macs_target_budget),
-        "maximum_avg_rank": float(ranks_maximum),
-        "target_avg_rank": float(ranks_target),
-        "target_avg_rank_normalized": float(avg_target_rank_normalized),
-    },
-    
-    # Training configuration
-    "training": {
-        "num_epochs": NUM_EPOCHS,
-        "init_learning_rate": INIT_LEARNING_RATE,
-        "min_learning_rate": MIN_LEARNING_RATE,
-        "optimizer": "Adam",
-        "scheduler": "CosineAnnealingLR",
-        "scheduler_mode": SCHEDULER_MODE,
-        "log_every_n_steps": LOG_EVERY_N_STEPS,
+        "breakeven_macs": float(breakeven_macs),
+        "breakeven_avg_rank": float(breakeven_avg_rank),
+        "target": float(macs_target_total),
+        "target_fraction": float(full_config.loss.target_mac_fraction),
+        "target_budget_for_ranks": float(macs_low_rank_budget),
+        "target_avg_rank": float(target_avg_rank),
+        "target_avg_rank_normalized": float(target_avg_rank_normalized),
     },
 }
-
-import json
-config_path = run_dir / "config.json"
-with open(config_path, 'w') as f:
-    json.dump(config_dict, f, indent=2)
-print(f"Configuration saved to: {config_path}")
+runtime_path = run_dir / "runtime_info.json"
+with open(runtime_path, 'w') as f:
+    json.dump(runtime_info, f, indent=2)
+print(f"Runtime information saved to: {runtime_path} \n")
 
 # Train model
 model, epoch_logs, step_logs = fit_dynamic_model(
@@ -291,18 +331,18 @@ model, epoch_logs, step_logs = fit_dynamic_model(
     optimizer=optimizer,
     criterion=criterion,
     device=DEVICE,
-    epochs=NUM_EPOCHS,
+    epochs=full_config.training.num_epochs,
     scheduler=scheduler,
     run_dir=str(run_dir),
     max_rank=maximum_useful_rank,
     val_loader=val_loader,
-    val_snr_values=VAL_SNR_VALUES,
+    val_snr_values=full_config.data_loader.val_snr_values if full_config.data_loader.do_validation else None,
     val_epoch=1,
-    enable_rank_supervision=ENABLE_RANK_SUPERVISION,
-    rank_supervision_stable=RANK_SUPERVISION_STABLE,
-    save_epoch_checkpoints=False,
-    log_every_n_steps=LOG_EVERY_N_STEPS,
-    scheduler_mode=SCHEDULER_MODE,
+    enable_rank_supervision=full_config.loss.enable_rank_supervision,
+    rank_supervision_stable=full_config.loss.rank_supervision_stable,
+    save_epoch_checkpoints=full_config.training.save_epoch_checkpoints,
+    log_every_n_steps=full_config.training.log_every_n_steps,
+    scheduler_mode=full_config.training.scheduler_mode,
     )
 
 print("\nTraining completed!")
