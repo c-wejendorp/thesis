@@ -10,7 +10,7 @@ class RouterConfig(BaseModel):
     use_global_rank: bool = Field(..., description="Whether to use a single global rank for all stacks")
     num_rank_outputs: int = Field(..., ge=1, description="Number of rank outputs (should match number of stacks if not using global rank)")
     pool_mode: Optional[Literal["avg", "max", "subsample"]] = Field(
-        ..., 
+        None, 
         description="Pooling mode for temporal dimension. None means no pooling"
     )
     pool_reduction_factor: int = Field(
@@ -18,8 +18,8 @@ class RouterConfig(BaseModel):
         ge=1, 
         description="Reduction factor for pooling (e.g., 2 means pick every 2nd element for subsample)"
     )
-    last_layer_bias_init: float = Field(
-        ..., 
+    last_layer_bias_init: Optional[float] = Field(
+        None, 
         description="Bias initialization for last layer (positive values bias towards higher ranks)"
     )
     
@@ -55,9 +55,17 @@ class DataLoaderConfig(BaseModel):
 class LossConfig(BaseModel):
     """Configuration for the loss function."""
     rank_loss_weight: float = Field(..., ge=0.0, description="Weight for rank regularization loss")
-    rank_loss_mode: str = Field(
+    rank_loss_mode: Literal[
+        "batch_mean_mse", 
+        "per_sample_mse", 
+        "avg_rank", 
+        "riccardo_special", 
+        "asymmetric_mse", 
+        "one_sided_mse", 
+        "ce_gated"
+    ] = Field(
         ..., 
-        description="Mode for rank loss computation (e.g., 'one_sided_mse', 'mse', 'l1')"
+        description="Mode for rank loss computation"
     )
     compressed_base_model_rank_pr_stack: list[int] = Field(
         ...,

@@ -30,7 +30,7 @@ def fit_dynamic_model(
     rank_supervision_stable: bool = False,  # if True, require prediction to be correct at all higher ranks too
     save_epoch_checkpoints: bool = False,  # if True, save model checkpoint after each epoch
     log_every_n_steps: Optional[int] = 1,  # if set, log metrics every N steps (1 = every batch/step)
-    scheduler_mode: Literal['epoch', 'step'] = 'step',  # when to step the scheduler
+    scheduler_mode: Literal['epoch', 'step'] | None = 'step',  # when to step the scheduler
 ) -> Tuple[nn.Module, List[Dict[str, Any]], List[Dict[str, Any]]]:
    
     if run_dir is None:
@@ -272,6 +272,10 @@ def fit_dynamic_model(
             "target_rank_normalized": getattr(criterion, "target_rank_normalized", None),
         }
             
+        # Always update best_train_loss (regardless of validation)
+        if train_loss_epoch < best_train_loss:
+            best_train_loss = train_loss_epoch
+        
         # Save "best" based on validation loss (or training loss if no validation)
         use_val_for_best = val_loader is not None and val_loss_epoch is not None
         current_metric = val_loss_epoch if use_val_for_best else train_loss_epoch
@@ -280,8 +284,9 @@ def fit_dynamic_model(
         if current_metric < best_metric: #type: ignore
             if use_val_for_best:
                 best_val_loss = current_metric
+                print(f"  💾 Saved best model (val_loss: {val_loss_epoch:.4f})")
             else:
-                best_train_loss = current_metric
+                print(f"  💾 Saved best model (train_loss: {train_loss_epoch:.4f})")
             torch.save(checkpoint, model_path)
 
         # Save model checkpoint every epoch (if enabled)
@@ -307,7 +312,7 @@ def fit_dynamic_model(
             "val_mean_rank_normalized": val_mean_rank_normalized_epoch,
             "val_expected_rank": val_expected_rank_epoch,
             "val_rank_loss_weighted": val_rank_loss_weighted_epoch,
-            "best_val_loss": best_val_loss if val_loader is not None else None,
+            "best_val_loss": best_val_loss,
             "val_results_all_snr": val_results,
             # Track loss weights if you anneal them
             "rank_loss_weight": getattr(criterion, "rank_loss_weight", None),
