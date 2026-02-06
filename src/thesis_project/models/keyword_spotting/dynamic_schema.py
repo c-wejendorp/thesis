@@ -69,13 +69,12 @@ class LossConfig(BaseModel):
     )
     compressed_base_model_rank_pr_stack: list[int] = Field(
         ...,
-        description="Reference rank per stack for computing base model MACs"
+        description="Rank per stack for a compressed base model used as a comparison reference point (not the target)"
     )
-    target_mac_fraction: float = Field(
+    base_model_rank_reference: float = Field(
         ..., 
-        gt=0.0, 
-        le=1.0, 
-        description="Target MACs as a fraction of base model MACs"
+        gt=0.0,
+        description="Reference rank for computing MAC budget. Total MACs = base_model_at_this_rank. After router overhead, the achievable dynamic model rank will be lower."
     )
     enable_rank_supervision: bool = Field(
         ..., 

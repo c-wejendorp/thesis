@@ -46,7 +46,9 @@ def fit_dynamic_model(
     step_logs = []
     global_step = 0
     best_train_loss = float("inf")
+    best_train_acc = 0.0
     best_val_loss = float("inf")
+    best_val_acc = 0.0
 
     # ----------- TRAINING ----------
     for epoch in range(epochs):
@@ -275,6 +277,7 @@ def fit_dynamic_model(
         # Always update best_train_loss (regardless of validation)
         if train_loss_epoch < best_train_loss:
             best_train_loss = train_loss_epoch
+            best_train_acc = train_acc_epoch
         
         # Save "best" based on validation loss (or training loss if no validation)
         use_val_for_best = val_loader is not None and val_loss_epoch is not None
@@ -284,6 +287,7 @@ def fit_dynamic_model(
         if current_metric < best_metric: #type: ignore
             if use_val_for_best:
                 best_val_loss = current_metric
+                best_val_acc = val_acc_epoch  #type: ignore
                 print(f"  💾 Saved best model (val_loss: {val_loss_epoch:.4f})")
             else:
                 print(f"  💾 Saved best model (train_loss: {train_loss_epoch:.4f})")
@@ -306,6 +310,7 @@ def fit_dynamic_model(
             "train_expected_rank": train_expected_rank_epoch,
             "train_mean_r_stacks": train_mean_r_stacks_epoch,
             "best_train_loss": best_train_loss,
+            "best_train_acc": best_train_acc,
             # Validation metrics
             "val_loss": val_loss_epoch,
             "val_acc": val_acc_epoch,
@@ -313,6 +318,7 @@ def fit_dynamic_model(
             "val_expected_rank": val_expected_rank_epoch,
             "val_rank_loss_weighted": val_rank_loss_weighted_epoch,
             "best_val_loss": best_val_loss,
+            "best_val_acc": best_val_acc,
             "val_results_all_snr": val_results,
             # Track loss weights if you anneal them
             "rank_loss_weight": getattr(criterion, "rank_loss_weight", None),

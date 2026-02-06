@@ -152,42 +152,51 @@ def setup_and_train_dynamic_model(
     assert len(full_config.loss.compressed_base_model_rank_pr_stack) == len(base_model.backbone), \
            "compressed_base_model_rank_pr_stack must match number of stacks in base model backbone"
     
-    # Compute MACs
-    macs_base_model = compute_macs_base_model(
+    # Compute MACs for compressed base model (reference point for comparison)
+    macs_compressed_base_model = compute_macs_base_model(
         base_model, 
         time_steps=63, 
         rank_pr_stack=full_config.loss.compressed_base_model_rank_pr_stack
     )
     macs_router = router.compute_macs(sequence_length=63)
-    
-    breakeven_macs = macs_base_model - macs_router
+    breakeven_macs = macs_compressed_base_model - macs_router
     breakeven_avg_rank = compute_avg_rank_from_macs(
         base_model, 
         time_steps=63, 
         macs=breakeven_macs,
         num_stacks=len(base_model.backbone)
     )
+
+    # Compute target MACs based on base_model_rank_reference
+    # This represents the total MAC budget (matching base model at reference rank)
+    macs_base_at_reference = compute_macs_base_model(
+        base_model,
+        time_steps=63,
+        rank_pr_stack=[int(full_config.loss.base_model_rank_reference)] * len(base_model.backbone)
+    )
     
-    macs_target_total = full_config.loss.target_mac_fraction * macs_base_model
-    macs_low_rank_budget = int(macs_target_total - macs_router)
+    # After accounting for router overhead, compute achievable average rank for dynamic model
+    macs_low_rank_budget = int(macs_base_at_reference - macs_router)
     target_avg_rank = compute_avg_rank_from_macs(
         base_model, 
         time_steps=63, 
         macs=macs_low_rank_budget,
         num_stacks=len(base_model.backbone)
     )
+
+
     
     target_avg_rank_normalized = (target_avg_rank - 1) / (maximum_useful_rank - 1)
     print(f"\nMACs Breakdown:")
-    print(f"  Base model total: {macs_base_model}")
+    print(f"  Compressed base model: {macs_compressed_base_model}")
     print(f"  Router overhead: {macs_router}")
-    print(f"  Breakeven MACs (base - router): {breakeven_macs}")
+    print(f"  Breakeven MACs (compressed base - router): {breakeven_macs}")
     print(f"  Breakeven average rank: {breakeven_avg_rank:.2f}")
-    print(f"\nTarget Configuration (fraction={full_config.loss.target_mac_fraction}):")
-    print(f"  Target total (low rank model + router overhead): {macs_target_total:.2f}")
-    print(f"  Target budget low rank model: {macs_low_rank_budget}")
-    print(f"  Target average rank: {target_avg_rank:.2f}")
-    print(f"  Target average rank (normalized): {target_avg_rank_normalized:.3f}")
+    print(f"\nTarget Configuration (base_model_rank_reference={full_config.loss.base_model_rank_reference}):")
+    print(f"  Target total budget (= base at reference rank): {macs_base_at_reference:.2f}")
+    print(f"  Target budget for dynamic model (after router overhead): {macs_low_rank_budget}")
+    print(f"  Target budget for dynamic model in ranks: {target_avg_rank:.2f}")
+    print(f"  Target budget for dynamic model in ranks (normalized): {target_avg_rank_normalized:.3f}\n")
     
     # Create loss criterion
     criterion = create_dynamic_routing_loss(
@@ -255,15 +264,15 @@ def setup_and_train_dynamic_model(
             "trainable_params": n_trainable,
         },
         "macs": {
-            "base_model": float(macs_base_model),
+            "compressed_base_model": float(macs_compressed_base_model),
             "router": float(macs_router),
             "breakeven_macs": float(breakeven_macs),
             "breakeven_avg_rank": float(breakeven_avg_rank),
-            "target": float(macs_target_total),
-            "target_fraction": float(full_config.loss.target_mac_fraction),
-            "target_budget_for_ranks": float(macs_low_rank_budget),
-            "target_avg_rank": float(target_avg_rank),
-            "target_avg_rank_normalized": float(target_avg_rank_normalized),
+            "base_at_reference_rank": float(macs_base_at_reference),
+            "base_model_rank_reference": float(full_config.loss.base_model_rank_reference),
+            "low_rank_budget": float(macs_low_rank_budget),
+            "achievable_avg_rank": float(target_avg_rank),
+            "achievable_avg_rank_normalized": float(target_avg_rank_normalized),
         },
     }
     runtime_path = run_dir / "runtime_info.json"
@@ -299,8 +308,11 @@ def setup_and_train_dynamic_model(
     if epoch_logs is not None and len(epoch_logs) > 0:
         last_epoch = epoch_logs[-1]
         print(f"\nFinal metrics:")
-        print(f"  Train loss: {last_epoch.get('train_loss'):.4f}")
-        print(f"  Train acc: {last_epoch.get('train_acc'):.2f}%")
+        print(f"  Train loss: {last_epoch.get('train_loss'):.4f}   Train acc: {last_epoch.get('train_acc'):.2f}%")
+        print(f"  Best train loss: {last_epoch.get('best_train_loss'):.4f}   Acc at best: {last_epoch.get('best_train_acc'):.2f}%")
+        if last_epoch.get('val_loss') is not None:
+            print(f"  Val loss: {last_epoch.get('val_loss'):.4f}   Val acc: {last_epoch.get('val_acc'):.2f}%")
+            print(f"  Best val loss: {last_epoch.get('best_val_loss'):.4f}   Acc at best: {last_epoch.get('best_val_acc'):.2f}%")
         print(f"  Expected rank: {last_epoch.get('train_expected_rank'):.1f}")
     
     if step_logs is not None and len(step_logs) > 0:

@@ -58,7 +58,7 @@ loss_cfg = LossConfig(
     rank_loss_weight=20,
     rank_loss_mode="avg_rank",
     compressed_base_model_rank_pr_stack=[30, 30, 30],
-    target_mac_fraction=0.5,
+    base_model_rank_reference=15.0,  # Reference rank for MAC budget computation
     enable_rank_supervision=False,
     rank_supervision_stable=False,
 )
