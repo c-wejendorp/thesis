@@ -84,19 +84,18 @@ class GRURouter(nn.Module):
             effective_seq_len = sequence_length
 
         # Pooling MACs (proxy)
-        if self.pool_type == "avg":
+        if self.pool_type == "avg" or self.pool_type == "max": # max is a proxy since it doesn't have MACs but does have computational cost that scales similarly to avg pooling
             total_macs += (
-                self.pool_reduction_factor
-                * effective_seq_len
-                * self.gru.input_size
+            effective_seq_len
+            * self.gru.input_size
             )
 
-        elif self.pool_type == "max":
-            total_macs += (
-                (self.pool_reduction_factor - 1)
-                * effective_seq_len
-                * self.gru.input_size
-            )
+        # elif self.pool_type == "max":
+        #     total_macs += (
+        #         (self.pool_reduction_factor - 1)
+        #         * effective_seq_len
+        #         * self.gru.input_size
+        #     )
 
         # GRU MACs
         total_macs += (
