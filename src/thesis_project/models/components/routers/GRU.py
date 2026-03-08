@@ -20,7 +20,10 @@ class GRURouter(nn.Module):
         self.pool_reduction_factor = pool_reduction_factor
                
         # Create pooling layer for smoothing along temporal dimension
-        if pool_type == 'avg':
+        # If pool_reduction_factor is 1, treat as no pooling regardless of pool_type
+        if pool_reduction_factor == 1 or pool_type is None:
+            self.pool = None  # no pooling
+        elif pool_type == 'avg':
             self.pool = nn.AvgPool1d(
                 kernel_size=self.pool_reduction_factor, 
                 stride=self.pool_reduction_factor, 
@@ -35,9 +38,6 @@ class GRURouter(nn.Module):
         elif pool_type == 'subsample':
             # works on (B, F, T) to mimic the maxpooling behavior, so remember to transpose before/after
             self.pool = lambda x: x[:, :, ::self.pool_reduction_factor]
-
-        elif pool_type is None:
-            self.pool = None  # no pooling
         else: 
             raise ValueError(f"pool_type must be None, 'avg', 'max', or 'subsample', got {pool_type}")
         

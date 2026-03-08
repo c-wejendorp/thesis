@@ -253,19 +253,20 @@ class OneSidedMSELoss(DynamicRoutingLoss):
         return F.relu(error).pow(2).mean()
 
 
-class RiccardoSpecialLoss(DynamicRoutingLoss):
+class CEWeightedRankLoss(DynamicRoutingLoss):
     """
-    CE-weighted rank loss: samples with higher CE get more rank penalty.
-    Encourages the model to use more compute on harder samples.
+    Penalizes rank more strongly on easy samples and less strongly on hard samples.
+    Encourages compute to be saved where classification is already easy.
     """
-    
+
     REQUIRED_PARAMS = []
     REQUIRES_TARGET = False
 
     def compute_rank_loss(self, r_normalized_batch, target_rank_normalized, **kwargs):
-        ce_loss_per_sample = kwargs["ce_loss_per_sample"]
-        # Normalize CE losses to sum to batch size
-        weights = ce_loss_per_sample.detach() / ce_loss_per_sample.detach().sum()
+        ce = kwargs["ce_loss_per_sample"].detach()
+        ce_rel = ce / (ce.mean() + 1e-8)
+        weights = 1.0 / (1.0 + ce_rel)
+        weights = weights / weights.sum()
         weights *= len(weights)
         return (weights * r_normalized_batch).mean()
 
@@ -385,7 +386,7 @@ def create_dynamic_routing_loss(
         "batch_mean_mse": BatchMeanMSELoss,
         "per_sample_mse": PerSampleMSELoss,
         "avg_rank": AvgRankLoss,
-        "riccardo_special": RiccardoSpecialLoss,
+        "ce_weighted_rank": CEWeightedRankLoss,
         "asymmetric_mse": AsymmetricMSELoss,
         "one_sided_mse": OneSidedMSELoss,
         "ce_gated": CEGatedLoss,

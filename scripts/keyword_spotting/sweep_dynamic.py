@@ -20,7 +20,7 @@ from thesis_project.training.key_word_spotting.loss_functions import (
     PerSampleMSELoss,
     AvgRankLoss,
     OneSidedMSELoss,
-    RiccardoSpecialLoss,
+    CEWeightedRankLoss,
     AsymmetricMSELoss,
     CEGatedLoss,
 )
@@ -30,6 +30,7 @@ def create_sweep_configs(
     loss_types: List[str],
     rank_weights: List[float],
     rank_targets: Optional[List[float]] = None,
+    pool_reduction_factors: List[int] = [2],
 ):
     """
     Create all combinations of hyperparameters for sweep.
@@ -39,10 +40,8 @@ def create_sweep_configs(
         loss_types: List of loss modes (e.g., ['avg_rank'])
         rank_weights: List of rank loss weights (e.g., [10, 20, 30])
         rank_targets: List of target ranks for base_model_rank_reference (e.g., [10, 20, 30])
+        pool_reduction_factors: List of pool reduction factors (e.g., [2, 4, 8])
     """
-    # Set defaults
-    if rank_targets is None:
-        rank_targets = [10.0, 20.0, 30.0]
     
     # Map loss names to classes to check REQUIRES_TARGET
     loss_class_map = {
@@ -50,7 +49,7 @@ def create_sweep_configs(
         "per_sample_mse": PerSampleMSELoss,
         "avg_rank": AvgRankLoss,
         "one_sided_mse": OneSidedMSELoss,
-        "riccardo_special": RiccardoSpecialLoss,
+        "ce_weighted_rank": CEWeightedRankLoss,
         "asymmetric_mse": AsymmetricMSELoss,
         "ce_gated": CEGatedLoss,
     }
@@ -64,24 +63,9 @@ def create_sweep_configs(
         requires_target = getattr(loss_class, 'REQUIRES_TARGET', False) if loss_class else False
         
         for rank_weight in rank_weights:
-            # If loss doesn't require target, only create one config per router mode
-            if not requires_target:
-                for router_mode in router_modes:
-                    use_global_rank = router_mode == 'global'
-                    num_rank_outputs = 1 if use_global_rank else 3
-                    
-                    config = {
-                        'loss_type': loss_type,
-                        'rank_weight': rank_weight,
-                        'rank_target': 15.0,  # Set a default value (won't be used by loss)
-                        'router_mode': router_mode,
-                        'use_global_rank': use_global_rank,
-                        'num_rank_outputs': num_rank_outputs,
-                    }
-                    configs.append(config)
-            else:
-                # Loss requires target, loop over all rank_targets
-                for rank_target in rank_targets:
+            for pool_reduction_factor in pool_reduction_factors:
+                # If loss doesn't require target, only create one config per router mode
+                if not requires_target:
                     for router_mode in router_modes:
                         use_global_rank = router_mode == 'global'
                         num_rank_outputs = 1 if use_global_rank else 3
@@ -89,12 +73,30 @@ def create_sweep_configs(
                         config = {
                             'loss_type': loss_type,
                             'rank_weight': rank_weight,
-                            'rank_target': rank_target,
+                            'rank_target': 15.0,  # Set a default value (won't be used by loss)
                             'router_mode': router_mode,
                             'use_global_rank': use_global_rank,
                             'num_rank_outputs': num_rank_outputs,
+                            'pool_reduction_factor': pool_reduction_factor,
                         }
                         configs.append(config)
+                else:
+                    # Loss requires target, loop over all rank_targets
+                    for rank_target in rank_targets:
+                        for router_mode in router_modes:
+                            use_global_rank = router_mode == 'global'
+                            num_rank_outputs = 1 if use_global_rank else 3
+                            
+                            config = {
+                                'loss_type': loss_type,
+                                'rank_weight': rank_weight,
+                                'rank_target': rank_target,
+                                'router_mode': router_mode,
+                                'use_global_rank': use_global_rank,
+                                'num_rank_outputs': num_rank_outputs,
+                                'pool_reduction_factor': pool_reduction_factor,
+                            }
+                            configs.append(config)
     
     return configs
 
@@ -109,6 +111,7 @@ def run_experiment(config: dict, sweep_dir: Path, exp_number: int, base_config: 
         # Override sweep parameters in the base config
         base_config['router'].use_global_rank = config['use_global_rank']
         base_config['router'].num_rank_outputs = config['num_rank_outputs']
+        base_config['router'].pool_reduction_factor = config['pool_reduction_factor']
         base_config['loss'].rank_loss_weight = config['rank_weight']
         base_config['loss'].rank_loss_mode = config['loss_type']
         base_config['loss'].base_model_rank_reference = config['rank_target']
@@ -190,6 +193,9 @@ Examples:
   # Try different loss with multiple weights
   python sweep_dynamic.py --loss-types asymmetric_mse --rank-weights 5 10 15 20
   
+  # Sweep over multiple pool reduction factors
+  python sweep_dynamic.py --loss-types avg_rank --rank-weights 10 --pool-reduction-factor 2 4 8
+  
   # Use custom config file
   python sweep_dynamic.py --config my_config.json --loss-types avg_rank --rank-weights 10
   
@@ -201,7 +207,7 @@ Examples:
         '--loss-types',
         nargs='+',
         required=True,
-        choices=['avg_rank', 'batch_mean_mse', 'per_sample_mse', 'riccardo_special', 'asymmetric_mse', 'one_sided_mse', 'ce_gated'],
+        choices=['avg_rank', 'batch_mean_mse', 'per_sample_mse', 'ce_weighted_rank', 'asymmetric_mse', 'one_sided_mse', 'ce_gated'],
         help='Loss types to sweep over'
     )
     parser.add_argument(
@@ -215,8 +221,15 @@ Examples:
         '--rank-targets',
         nargs='+',
         type=float,
-        default=None,
+        default=[10.0, 20.0, 30.0],
         help='Target ranks for base_model_rank_reference (default: [10.0, 20.0, 30.0])'
+    )
+    parser.add_argument(
+        '--pool-reduction-factor',
+        nargs='+',
+        type=int,
+        default=[2],
+        help='Pool reduction factor(s) for router. Can specify multiple values to sweep over. Set to 1 for no pooling (default: [2])'
     )
     parser.add_argument(
         '--config',
@@ -274,6 +287,7 @@ Examples:
         loss_types=args.loss_types,
         rank_weights=args.rank_weights,
         rank_targets=args.rank_targets,
+        pool_reduction_factors=args.pool_reduction_factor,
     )
     
     print(f"\nGenerated {len(configs)} experiment configurations")

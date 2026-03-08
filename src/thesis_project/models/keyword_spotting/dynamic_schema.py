@@ -59,7 +59,7 @@ class LossConfig(BaseModel):
         "batch_mean_mse", 
         "per_sample_mse", 
         "avg_rank", 
-        "riccardo_special", 
+        "ce_weighted_rank", 
         "asymmetric_mse", 
         "one_sided_mse", 
         "ce_gated"
