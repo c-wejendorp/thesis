@@ -15,6 +15,7 @@ def validate_model(
     max_rank: int = 64,
     make_rank_hist: bool = False,
     return_per_sample: bool = False,
+    compute_loss: bool = True,
 ):
     """
     Unified validation function for both base and dynamic models.
@@ -31,6 +32,7 @@ def validate_model(
         max_rank: Maximum rank for dynamic models (used for histogram and expected rank)
         make_rank_hist: If True and is_dynamic=True, compute rank histogram
         return_per_sample: If True, return per-sample records as second return value
+        compute_loss: If False, skip criterion call and set loss=0. Useful when only accuracy is needed.
     
     Returns:
         results: dict {snr: {"loss": float, "acc": float, ...}}
@@ -87,19 +89,22 @@ def validate_model(
                     r_normalized = router_output_dict["ranks_normalized"]  # Access directly, same as training
                     r_cont = router_output_dict["ranks_cont"]
                     
-                    # Compute loss using same signature as training
-                    loss_out = criterion(
-                        classif_logits,
-                        labels,
-                        r_normalized,
-                        rank_supervision=None  # No rank supervision during validation
-                    )
-                    loss = loss_out.loss
-                    rank_loss_weighted = float(loss_out.rank_loss_weighted)
+                    if compute_loss:
+                        loss_out = criterion(
+                            classif_logits,
+                            labels,
+                            r_normalized,
+                            rank_supervision=None  # No rank supervision during validation
+                        )
+                        loss = loss_out.loss
+                        rank_loss_weighted = float(loss_out.rank_loss_weighted)
+                    else:
+                        loss = torch.tensor(0.0)
+                        rank_loss_weighted = 0.0
                 else:
                     # Base model
                     classif_logits = model(waveforms, ranks=fixed_rank)
-                    loss = criterion(classif_logits, labels)
+                    loss = criterion(classif_logits, labels) if compute_loss else torch.tensor(0.0)
                     r_normalized = None
                     r_cont = None
                     rank_loss_weighted = None
@@ -170,8 +175,15 @@ def validate_model(
                         }
                         
                         if is_dynamic:
-                            rec["rank"] = float(r_cont_cpu[i])
-                            rec["rank_normalized"] = float(r_normalized_cpu[i])
+                            r_c = r_cont_cpu[i]
+                            r_n = r_normalized_cpu[i]
+                            # r_cont may be per-stack (list) or global (scalar)
+                            if isinstance(r_c, (list, tuple)):
+                                rec["rank"] = [float(r) for r in r_c]
+                                rec["rank_normalized"] = [float(r) for r in r_n] if isinstance(r_n, (list, tuple)) else float(r_n)
+                            else:
+                                rec["rank"] = float(r_c)
+                                rec["rank_normalized"] = float(r_n)
                         else:
                             rec["rank"] = fixed_rank
                         
