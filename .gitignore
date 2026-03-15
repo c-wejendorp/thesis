@@ -16,3 +16,7 @@ wheels/
 
 # full models
 model_runs/
+
+# csv files in the figs and table directories
+Figs_and_tables/*.csv
+Figs_and_tables/**/*.csv

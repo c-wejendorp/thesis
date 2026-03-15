@@ -1,0 +1,29 @@
+\begin{table}[ht]
+\centering
+\caption{Per-noise accuracy at different ranks, averaged across SNR levels and classes}
+\label{tab:base_accuracy_by_noise}
+
+\setlength{\tabcolsep}{8pt}     % horizontal padding between columns
+\renewcommand{\arraystretch}{1.1} % vertical spacing between rows
+\resizebox{\textwidth}{!}{
+\begin{tabular}{ccccccccc}
+\toprule
+\multicolumn{1}{c}{Rank} &
+\multicolumn{1}{c}{doing the dishes} &
+\multicolumn{1}{c}{dude miaowing} &
+\multicolumn{1}{c}{exercise bike} &
+\multicolumn{1}{c}{pink noise} &
+\multicolumn{1}{c}{running tap} &
+\multicolumn{1}{c}{white noise} &
+\multicolumn{1}{c}{Micro Avg} &
+\multicolumn{1}{c}{Macro Avg} \\
+\midrule
+10 & 65.33 & 66.59 & 70.13 & 73.66 & 73.71 & 72.12 & 70.26 & 70.26 \\
+15 & 80.20 & 75.95 & 83.57 & 84.35 & 85.85 & 84.75 & 82.45 & 82.45 \\
+20 & 83.19 & 79.19 & 86.64 & 88.45 & 88.95 & 87.94 & 85.73 & 85.73 \\
+25 & 86.17 & 80.95 & 86.79 & 89.80 & 89.94 & 89.17 & 87.14 & 87.14 \\
+30 & \textbf{87.17} & \textbf{89.43} & \textbf{88.79} & \textbf{90.52} & \textbf{90.45} & \textbf{89.56} & \textbf{89.32} & \textbf{89.32} \\
+\bottomrule
+\end{tabular}
+}
+\end{table}

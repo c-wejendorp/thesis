@@ -37,12 +37,13 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
         upsample: bool = False,
         seed: int = 789,
         seed_deterministic_noise: Optional[int] = None,
+        seed_getitem: Optional[int] = None,
         transform=None,
         add_noise: bool = True,
-        noise_prob: float = 0.9,
+        noise_prob: float = 0.8,
         background_noise_folder: str = NOISE_FOLDER,
         noise_files: list[str] = NOISE_FILES,
-        snr: float | tuple[float, float] = (-5, 15),
+        snr: Optional[float | tuple[float, float]] = None,
         **kwargs,
     ):
         super().__init__(*args, subset=subset, **kwargs)
@@ -58,6 +59,10 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
         self.seed = seed
         self.seed_deterministic_noise = (
             seed if seed_deterministic_noise is None else seed_deterministic_noise)
+        
+        # Deterministic training augmentation
+        self.seed_getitem = seed if seed_getitem is None else seed_getitem
+        self._call_counter = 0  # Global counter for all __getitem__ calls
 
         self.transform = transform if transform is not None else PadOrTrim()
 
@@ -74,7 +79,21 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
         self.add_noise = add_noise
         if self.add_noise:
             self.noise_prob = noise_prob
-            self._set_snr(snr)
+            # In evaluation mode, noise_prob must be 1.0 (always add noise when enabled)
+            if self.evaluation and self.noise_prob != 1.0:
+                raise ValueError(
+                    f"In evaluation mode with add_noise=True, noise_prob must be 1.0 (got {noise_prob}). "
+                    "Evaluation requires deterministic behavior: either always add noise (noise_prob=1.0) "
+                    "or disable noise completely (add_noise=False)."
+                )
+            if not self.evaluation:
+                # Training mode: set SNR from parameter (default to range if not provided)
+                if snr is None:
+                    snr = (-5, 15)
+                self.set_snr(snr)
+            else:
+                # Evaluation mode: SNR must be set later via set_snr() before use
+                self.snr = None
         else:
             self.noise_prob = 0.0
             self.snr = float("inf")
@@ -86,13 +105,17 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
     # Initialization helpers
     # ------------------------------------------------------------------
 
-    def _set_snr(self, snr: float | tuple[float, float]) -> None:
-        """Validate and store SNR configuration."""
+    def set_snr(self, snr: float | tuple[float, float]) -> None:
+        """Validate and store SNR configuration.
+        
+        In evaluation mode, this must be called before accessing samples when add_noise=True.
+        """
         assert self.add_noise, "Cannot set SNR if add_noise is False."
 
         # Ranges not allowed in evaluation mode
         if self.evaluation and isinstance(snr, tuple):
-            raise ValueError("In evaluation mode, snr must be a single float (or inf).")
+            raise ValueError("In evaluation mode, snr must be a single float (or inf). " \
+            "In the validation function we use this function over a range of SNRs, but each individual call should have a fixed SNR value.")
 
         # Float case (includes float('inf'))
         if isinstance(snr, (int, float)):
@@ -261,6 +284,15 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
 
     def __len__(self) -> int:
         return len(self.samples)
+
+    def _get_rng_for_index(self, index: int) -> random.Random:
+        """
+        Get deterministic RNG and increment global call counter.
+        Each __getitem__ call gets a different but deterministic RNG.
+        """
+        seed = self.seed_getitem + self._call_counter
+        self._call_counter += 1
+        return random.Random(seed)
     
     def __getitem__(self, n: int) -> tuple[Tensor, int, dict]:
         sample_info = self.samples[n]
@@ -270,6 +302,11 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
 
         noise = sample_info.get("noise", None)
         noise_type = sample_info.get("noise_type", None)  # may start as None
+
+        # Get deterministic RNG for training mode
+        rng = None
+        if not self.evaluation:
+            rng = self._get_rng_for_index(n)
 
         # --------- 1) Load base waveform (before transforms) ---------
         if kind == "silence":
@@ -284,8 +321,8 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
                 waveform = noise.clone()
                 utterance = noise_type
             else:
-                # Training: random silence chunk
-                waveform, utterance = self._load_random_noise_chunk(self.silence_paths)
+                # Training: deterministic random silence chunk
+                waveform, utterance = self._load_random_noise_chunk(self.silence_paths, rng=rng)
 
             sample_rate = SAMPLE_RATE
             utterance_number = -1
@@ -315,6 +352,14 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
                 snr_value = float("inf")
             else:
                 # Eval WITH deterministic noise:
+                # Check if SNR has been set
+                if self.snr is None:
+                    raise RuntimeError(
+                        "In evaluation mode with add_noise=True, you must set the SNR before accessing samples.\n"
+                        "Call dataset.set_snr(value) where value is a float (e.g., 10.0 for 10dB SNR, or float('inf') for no noise).\n"
+                        "Example: dataset.set_snr(10.0)"
+                    )
+                
                 # attach_deterministic_noise_to_samples should have filled these
                 assert noise is not None, (
                     "In evaluation mode and add_noise=True, all samples should have deterministic noise attached"
@@ -328,6 +373,10 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
                     snr_value = float("inf")
                 else:
                     # Keywords/unknown: inject deterministic noise at fixed eval SNR
+                    # In eval mode, noise_prob is validated to be 1.0, so we always add noise
+                    assert self.noise_prob == 1.0, (
+                        "In evaluation mode with add_noise=True, noise_prob must be 1.0"
+                    )
                     snr_value = self._sample_snr_value()  # fixed float in eval
                     waveform = add_noise_at_snr(waveform, noise, snr_value)
 
@@ -339,15 +388,15 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
                 noise_type = ""  # <- string, not None
                 snr_value = float("inf")
             else:
-                snr_value = self._sample_snr_value()
+                snr_value = self._sample_snr_value(rng=rng)
 
                 if kind == "silence":
                     # Silence is just its own noise in training
                     noise = waveform.clone()
                     noise_type = utterance  # filename / descriptor string
                 else:  # keyword or unknown
-                    if random.random() < self.noise_prob:
-                        noise, noise_type = self._load_random_noise_chunk(self.noise_paths)
+                    if rng.random() < self.noise_prob:
+                        noise, noise_type = self._load_random_noise_chunk(self.noise_paths, rng=rng)
                         waveform = add_noise_at_snr(waveform, noise, snr_value)
                     else:
                         # No noise added: zero tensor to keep collate happy
@@ -382,15 +431,18 @@ class SpeechCommandsGoogle(SPEECHCOMMANDS):
             waveform = self.transform(waveform)
         return waveform
     
-    def _sample_snr_value(self) -> float:
+    def _sample_snr_value(self, rng: Optional[random.Random] = None) -> float:
         if isinstance(self.snr, (int, float)):
             return float(self.snr)
         low, high = self.snr
+        if rng is not None:
+            return float(rng.uniform(low, high))
         return float(torch.empty(1).uniform_(low, high).item())
 
-    def _load_random_noise_chunk(self, noise_paths: list[str]) -> tuple[Tensor, str]:
+    def _load_random_noise_chunk(self, noise_paths: list[str], rng: Optional[random.Random] = None) -> tuple[Tensor, str]:
         return load_random_noise_chunk(
             noise_paths=noise_paths,
             target_length=TARGET_LENGTH,
             sample_rate=SAMPLE_RATE,
+            rng=rng,
         )

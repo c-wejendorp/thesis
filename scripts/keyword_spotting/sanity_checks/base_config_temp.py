@@ -33,7 +33,7 @@ noise_train_cfg=NoiseConfig(
 
 noise_eval_cfg=NoiseConfig(
     add_noise=True,
-    noise_prob=1.0,
+    noise_prob=0.8,
     snr=float("inf"))
 
 cfg = KeyWordSpottingBaseConfig(

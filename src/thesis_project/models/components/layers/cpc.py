@@ -95,7 +95,7 @@ class LowRankPointwiseConv1d(nn.Module):
         mask = ste_rank_mask(
             r_cont=r_cont,            # FLOAT ranks -> gradients can flow to router
             max_rank=self.max_rank,
-            tau=0.1,
+            tau=0.7,
             device=h.device,
             dtype=h.dtype,
         )                                               # (B, R)
