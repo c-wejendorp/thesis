@@ -1,12 +1,16 @@
+from typing import Union
+
 from thesis_project.models.keyword_spotting import KWSBase, KWSDynamic
 
 
-def compute_macs_base_model(base_model: KWSBase, time_steps: int, rank_pr_stack: list) -> int:
+def compute_macs_base_model(base_model: Union[KWSBase, dict], time_steps: int, rank_pr_stack: list) -> int:
     """
     Compute MACs for the base model given time steps and ranks per stack.
 
     Args:
-        base_model: The base model instance
+        base_model: Either a KWSBase instance or a dict with a "backbone" section
+                containing n_stacks, n_channels_ext, n_channels_int,
+                and n_blocks_pr_stack.
         time_steps: Number of time steps in the input
         rank_pr_stack: List of ranks for each stack in the backbone
 
@@ -14,12 +18,24 @@ def compute_macs_base_model(base_model: KWSBase, time_steps: int, rank_pr_stack:
         Total MACs for the base model
     """
 
-    assert len(rank_pr_stack) == len(base_model.backbone), \
+    if isinstance(base_model, dict):
+        backbone_info = base_model["backbone"]
+        n_stacks = int(backbone_info["n_stacks"])
+        n_channels_ext = backbone_info["n_channels_ext"]
+        n_channels_int = backbone_info["n_channels_int"]
+        n_blocks_pr_stack = backbone_info["n_blocks_pr_stack"]
+    else:
+        n_stacks = len(base_model.backbone)
+        n_channels_ext = base_model.cfg.backbone.n_channels_ext
+        n_channels_int = base_model.cfg.backbone.n_channels_int
+        n_blocks_pr_stack = base_model.cfg.backbone.n_blocks_pr_stack
+
+    assert len(rank_pr_stack) == n_stacks, \
     "Length of rank_pr_stack must match number of stacks in the backbone."
 
     # total MACs across all stacks = (MACs 1 rank layer) * 2 layers per block * n_blocks_pr_stack * sum of ranks across stacks
-    macs = time_steps * (base_model.cfg.backbone.n_channels_ext + base_model.cfg.backbone.n_channels_int)
-    macs *= 2 * base_model.cfg.backbone.n_blocks_pr_stack
+    macs = time_steps * (n_channels_ext + n_channels_int)
+    macs *= 2 * n_blocks_pr_stack
     macs *= sum(rank_pr_stack)
     return int(macs)
 
